@@ -129,3 +129,5 @@ Apache 2.0 — free to use, modify, and distribute.
 ⭐️ If you find this project helpful…
 
 Add a star on GitHub to support future learning-friendly AI projects!
+
+(Temporary edit for Git practice)
