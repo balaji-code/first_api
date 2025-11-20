@@ -5,35 +5,54 @@ import os
 import openai
 from flask import Flask, request, jsonify
 
+
 app = Flask(__name__)
+
+# Simple in-memory cache for responses
 CACHE = {}
 CACHE_TTL = 60 * 60  # 1 hour
+
+# OpenAI configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 if not OPENAI_API_KEY:
     print("Warning: OPENAI_API_KEY not set. /summarize will return an error until it's provided.")
 else:
     openai.api_key = OPENAI_API_KEY
+
+
 def cache_get(key):
+    """Fetch a cached value by key, respecting TTL."""
     entry = CACHE.get(key)
     if not entry:
         return None
+
     ts, value = entry
     if time.time() - ts > CACHE_TTL:
+        # Expired, remove and treat as a miss
         del CACHE[key]
         return None
+
     return value
 
+
 def cache_set(key, value):
+    """Store a value in the in-memory cache with the current timestamp."""
     CACHE[key] = (time.time(), value)
+
+
 # Simple GET to prove the server is alive
 @app.route("/hello", methods=["GET"])
 def hello():
+    """Health check endpoint."""
     return jsonify({"message": "Hello from your API", "status": "ok"}), 200
 
 # POST endpoint that echoes back the received JSON
 @app.route("/echo", methods=["POST"])
 def echo():
+    """Echo back validated JSON payload."""
+
     # 1. JSON must exist
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 400
@@ -56,6 +75,8 @@ def echo():
 
 @app.route("/summarize", methods=["POST"])
 def summarize():
+    """Summarize the provided text using OpenAI."""
+
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 400
 
@@ -116,6 +137,8 @@ def summarize():
 
 @app.route("/keywords", methods=["POST"])
 def keywords():
+    """Extract up to 5 important keywords from the text."""
+
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 400
 
@@ -195,6 +218,8 @@ def keywords():
 
 @app.route("/sentiment", methods=["POST"])
 def sentiment():
+    """Classify sentiment (positive / neutral / negative) for the given text."""
+
     # Validate JSON input
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 400
