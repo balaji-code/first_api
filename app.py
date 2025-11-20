@@ -336,5 +336,73 @@ def sentiment():
     except Exception as e:
         return jsonify({"error": "Server error", "detail": str(e)}), 500
 
+
+@app.route("/entities", methods=["POST"])
+def entities():
+    """Extract named entities grouped by type."""
+
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+
+    data = request.get_json()
+
+    if "text" not in data:
+        return jsonify({"error": "'text' field is required"}), 400
+
+    if not isinstance(data["text"], str):
+        return jsonify({"error": "'text' must be a string"}), 400
+
+    text = data["text"].strip()
+    if not text:
+        return jsonify({"error": "'text' must be non-empty"}), 400
+
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OpenAI API key not configured"}), 500
+
+    try:
+        system_prompt = (
+            "Extract named entities from the text. "
+            "Return ONLY valid JSON with this structure:\n"
+            "{\n"
+            '  "people": [],\n'
+            '  "locations": [],\n'
+            '  "organizations": [],\n'
+            '  "dates": [],\n'
+            '  "other": []\n'
+            "}\n"
+            "Do not include explanations. Do not add extra keys."
+        )
+
+        from openai import OpenAI
+
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+        )
+
+        raw = resp.choices[0].message.content
+
+        import json
+
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return jsonify(
+                {
+                    "error": "Model returned invalid JSON",
+                    "raw": raw,
+                }
+            ), 502
+
+        return jsonify({"entities": parsed, "raw": raw}), 200
+
+    except Exception as e:
+        return jsonify({"error": "Server error", "detail": str(e)}), 500
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5050, debug=True)
