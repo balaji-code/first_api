@@ -193,5 +193,123 @@ def keywords():
     except Exception as e:
         return jsonify({"error": "Server error", "detail": str(e)}), 500
 
+@app.route("/sentiment", methods=["POST"])
+def sentiment():
+    # Validate JSON input
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+
+    data = request.get_json()
+    if "text" not in data:
+        return jsonify({"error": "'text' field is required"}), 400
+    if not isinstance(data["text"], str):
+        return jsonify({"error": "'text' must be a string"}), 400
+
+    text = data["text"].strip()
+    if text == "":
+        return jsonify({"error": "'text' must be a non-empty string"}), 400
+
+    # Input length guard (prevent huge token bills)
+    MAX_CHARS_SENTIMENT = 4000
+    if len(text) > MAX_CHARS_SENTIMENT:
+        return jsonify({"error": "input_too_long", "detail": f"Text too long ({len(text)} chars). Max {MAX_CHARS_SENTIMENT}."}), 400
+
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OpenAI API key not configured on the server"}), 500
+
+    # Use the same in-memory cache pattern (sha256 text)
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    cached = cache_get(key)
+    if cached:
+        return jsonify(cached), 200
+
+    # Create OpenAI client (new-style)
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # Prompt: ask model to return only JSON with 'label' and 'score'
+    system_prompt = (
+        "You are a classifier. Given the user's text, return ONLY a JSON object "
+        "with two keys: 'label' and 'score'. 'label' must be one of: positive, neutral, negative. "
+        "'score' must be a number between 0.00 and 1.00 representing confidence. "
+        "Output must be valid JSON and nothing else. Example: {\"label\":\"positive\",\"score\":0.92}"
+    )
+    user_prompt = f"Classify the sentiment of this text and return the JSON object:\n\n{text}"
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=64,
+            temperature=0.0,
+            n=1,
+            timeout=30
+        )
+
+        # get raw model output text
+        try:
+            raw = resp.choices[0].message.content.strip()
+        except Exception:
+            raw = resp["choices"][0]["message"]["content"].strip()
+
+        # Try to parse JSON from model output
+        import json, re
+        m = re.search(r'(\{.*\})', raw, flags=re.S)
+        if m:
+            obj_text = m.group(1)
+            try:
+                parsed = json.loads(obj_text)
+            except Exception:
+                # fallback parsing: attempt to extract label and score naively
+                parsed = {}
+                lab = re.search(r'"?label"?\s*[:=]\s*"?(positive|neutral|negative)"?', raw, flags=re.I)
+                sc = re.search(r'"?score"?\s*[:=]\s*([0-9]*\.?[0-9]+)', raw)
+                if lab:
+                    parsed["label"] = lab.group(1).lower()
+                if sc:
+                    parsed["score"] = float(sc.group(1))
+        else:
+            # fallback: attempt naive extraction
+            parsed = {}
+            lab = re.search(r'(positive|neutral|negative)', raw, flags=re.I)
+            sc = re.search(r'([0-9]*\.?[0-9]+)', raw)
+            if lab:
+                parsed["label"] = lab.group(1).lower()
+            if sc:
+                parsed["score"] = float(sc.group(1))
+
+        # Validate parsed output and normalize
+        label = parsed.get("label")
+        score = parsed.get("score")
+
+        if label not in ("positive", "neutral", "negative"):
+            # If label invalid or missing, infer a neutral fallback
+            label = "neutral"
+
+        # Ensure score is a float in [0.0, 1.0]
+        try:
+            score = float(score)
+            if score < 0.0 or score > 1.0:
+                score = max(0.0, min(1.0, score))
+        except Exception:
+            # If no numeric score, set default based on label
+            score = {"positive": 0.9, "neutral": 0.5, "negative": 0.9}.get(label, 0.5)
+
+        result = {
+            "sentiment_raw": raw,
+            "label": label,
+            "score": round(score, 3)
+        }
+
+        # cache & return
+        cache_set(key, result)
+        return jsonify(result), 200
+
+    except Exception as e:
+        return jsonify({"error": "Server error", "detail": str(e)}), 500
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5050, debug=True)
