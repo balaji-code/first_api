@@ -404,5 +404,60 @@ def entities():
     except Exception as e:
         return jsonify({"error": "Server error", "detail": str(e)}), 500
 
+
+# ========================================
+# 5. /rewrite – Improve text clarity/grammar
+# ========================================
+@app.route("/rewrite", methods=["POST"])
+def rewrite():
+    """
+    Rewrites user text for better clarity, grammar, and flow using OpenAI.
+    """
+    # Validate JSON input
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+    
+    data = request.get_json()
+
+    if "text" not in data:
+        return jsonify({"error": "'text' field is required"}), 400
+
+    text = data["text"].strip()
+    if not isinstance(text, str) or text == "":
+        return jsonify({"error": "'text' must be a non-empty string"}), 400
+
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OpenAI API key not configured on the server"}), 500
+
+    # Create OpenAI client
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    system_prompt = (
+        "You are a writing assistant. Improve clarity, grammar, flow, and tone "
+        "while preserving the original meaning. Do NOT shorten too much or add facts."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.2
+        )
+
+        rewritten = response.choices[0].message.content.strip()
+
+        return jsonify({"rewritten": rewritten}), 200
+
+    except Exception as e:
+        return jsonify({"error": "AI processing error", "detail": str(e)}), 500
+
+
+# ========================================
+# Main entry point
+# ========================================
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5050, debug=True)
