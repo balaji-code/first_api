@@ -2,12 +2,14 @@
 import hashlib
 import time
 import os
+import json
 import openai
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 
 
 app = Flask(__name__)
-
+# ensure Flask's JSON responses do not escape non-ascii characters
+app.config['JSON_AS_ASCII'] = False
 # Simple in-memory cache for responses
 CACHE = {}
 CACHE_TTL = 60 * 60  # 1 hour
@@ -451,6 +453,77 @@ def rewrite():
         rewritten = response.choices[0].message.content.strip()
 
         return jsonify({"rewritten": rewritten}), 200
+
+    except Exception as e:
+        return jsonify({"error": "AI processing error", "detail": str(e)}), 500
+
+
+# ========================================
+# 6. /translate – Translate text to another language
+# ========================================
+@app.route("/translate", methods=["POST"])
+def translate():
+    """
+    Translates user text to a specified target language using OpenAI.
+    """
+    # Validate JSON input
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+
+    data = request.get_json()
+    if "text" not in data or "to" not in data:
+        return jsonify({"error": "'text' and 'to' fields are required"}), 400
+
+    text = data["text"]
+    to_lang = data["to"].strip()
+    
+    if not isinstance(text, str) or text.strip() == "":
+        return jsonify({"error": "'text' must be a non-empty string"}), 400
+    if not isinstance(to_lang, str) or to_lang == "":
+        return jsonify({"error": "'to' must be a non-empty language string"}), 400
+
+    # Input length guard
+    MAX_CHARS_TRANSLATE = 8000
+    if len(text) > MAX_CHARS_TRANSLATE:
+        return jsonify({
+            "error": "input_too_long",
+            "detail": f"Text too long ({len(text)} chars). Max {MAX_CHARS_TRANSLATE}."
+        }), 400
+
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OpenAI API key not configured on the server"}), 500
+
+    # Create OpenAI client
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    system_prompt = (
+        f"You are a precise translator. Translate the user's text to {to_lang}. "
+        "Preserve meaning exactly; do not add or remove information. "
+        "Output only the translated text, no commentary."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.0,
+            max_tokens=2000,
+            timeout=30
+        )
+
+        translated = resp.choices[0].message.content.strip()
+
+        # Return with proper UTF-8 encoding for non-ASCII characters
+        body = json.dumps(
+            {"translation": translated, "to": to_lang},
+            ensure_ascii=False
+        )
+
+        return Response(body, content_type="application/json; charset=utf-8"), 200
 
     except Exception as e:
         return jsonify({"error": "AI processing error", "detail": str(e)}), 500
