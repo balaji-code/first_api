@@ -530,6 +530,60 @@ def translate():
 
 
 # ========================================
+# 7. /classify – Categorize text into predefined categories
+# ========================================
+@app.route("/classify", methods=["POST"])
+def classify():
+    """
+    Classifies user text into predefined categories using OpenAI.
+    """
+    # Validate JSON input
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+
+    data = request.get_json()
+
+    if "text" not in data:
+        return jsonify({"error": "'text' field is required"}), 400
+
+    text = data["text"]
+    if not isinstance(text, str) or text.strip() == "":
+        return jsonify({"error": "'text' must be a non-empty string"}), 400
+
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OpenAI API key not configured on the server"}), 500
+
+    # Create OpenAI client
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    system_prompt = (
+        "You are a text classifier. "
+        "You MUST output a single category label from the following list: "
+        "Technology, Finance, Health, Education, Entertainment, Politics, Sports, Business, Other. "
+        "Respond *only* with the category name."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            max_tokens=10,
+            temperature=0
+        )
+
+        category = resp.choices[0].message.content.strip()
+
+        return jsonify({"category": category}), 200
+
+    except Exception as e:
+        return jsonify({"error": "Server error", "detail": str(e)}), 500
+
+
+# ========================================
 # Main entry point
 # ========================================
 if __name__ == "__main__":
