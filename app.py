@@ -584,6 +584,59 @@ def classify():
 
 
 # ========================================
+# 8. /chat – General-purpose chat endpoint
+# ========================================
+@app.route("/chat", methods=["POST"])
+def chat():
+    """
+    General-purpose chat endpoint that responds to user messages using OpenAI.
+    """
+    # Validate JSON input
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+
+    data = request.get_json()
+
+    if "message" not in data:
+        return jsonify({"error": "'message' field is required"}), 400
+
+    if not isinstance(data["message"], str):
+        return jsonify({"error": "'message' must be a string"}), 400
+
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OpenAI API key not configured on the server"}), 500
+
+    user_message = data["message"].strip()
+
+    if user_message == "":
+        return jsonify({"error": "'message' must be non-empty"}), 400
+
+    try:
+        # Create OpenAI client (local to function is fine)
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a helpful AI assistant."},
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=200,
+            temperature=0.5,
+            timeout=30
+        )
+
+        # Extract assistant text
+        reply = resp.choices[0].message.content.strip()
+
+        return jsonify({"reply": reply}), 200
+
+    except Exception as e:
+        return jsonify({"error": "OpenAI API error", "detail": str(e)}), 502
+
+
+# ========================================
 # Main entry point
 # ========================================
 if __name__ == "__main__":
