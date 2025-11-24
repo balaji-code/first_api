@@ -3,8 +3,12 @@ import hashlib
 import time
 import os
 import json
+
 import openai
+import requests
+from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, Response
+
 
 
 app = Flask(__name__)
@@ -631,6 +635,74 @@ def chat():
         reply = resp.choices[0].message.content.strip()
 
         return jsonify({"reply": reply}), 200
+
+    except Exception as e:
+        return jsonify({"error": "OpenAI API error", "detail": str(e)}), 502
+
+
+# ========================================
+# 9. /summarize-url – Summarize content from a URL
+# ========================================
+@app.route("/summarize-url", methods=["POST"])
+def summarize_url():
+    """
+    Fetches content from a URL and summarizes it using OpenAI.
+    """
+    # Validate JSON input
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+
+    data = request.get_json()
+
+    if "url" not in data:
+        return jsonify({"error": "'url' field is required"}), 400
+
+    url = data["url"]
+    if not isinstance(url, str) or url.strip() == "":
+        return jsonify({"error": "'url' must be a non-empty string"}), 400
+
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OpenAI API key not configured on the server"}), 500
+
+    # Fetch the webpage
+    try:
+        page = requests.get(url, timeout=10)
+    except Exception as e:
+        return jsonify({"error": "Failed to fetch URL", "detail": str(e)}), 400
+
+    if page.status_code != 200:
+        return jsonify({"error": f"URL returned status {page.status_code}"}), 400
+
+    # Extract text from HTML
+    soup = BeautifulSoup(page.text, "html.parser")
+    text = soup.get_text(separator=" ", strip=True)
+
+    if len(text) < 100:
+        return jsonify({"error": "Page text too short or not readable"}), 400
+
+    # Create OpenAI client
+    from openai import OpenAI
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    system_prompt = "Summarize this webpage text in 4–6 bullet points. Keep it factual."
+
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text[:6000]}  # Keep within safe limits
+            ],
+            temperature=0.3,
+            max_tokens=250
+        )
+
+        summary = response.choices[0].message.content.strip()
+
+        return jsonify({
+            "url": url,
+            "summary": summary
+        }), 200
 
     except Exception as e:
         return jsonify({"error": "OpenAI API error", "detail": str(e)}), 502
