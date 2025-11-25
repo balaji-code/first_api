@@ -709,6 +709,77 @@ def summarize_url():
 
 
 # ========================================
+# 10. /embed – Generate text embeddings
+# ========================================
+@app.route("/embed", methods=["POST"])
+def embed():
+    """
+    Input JSON:
+      {"text": "some text"}
+    or
+      {"texts": ["text1", "text2", ...]}
+
+    Output JSON:
+      {
+        "embeddings": [
+          {"input": "text1", "embedding": [...float numbers...]},
+          ...
+        ],
+        "model": "<model-name>"
+      }
+    """
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+
+    data = request.get_json()
+
+    # Accept single text or list of texts
+    texts = None
+    if "text" in data and isinstance(data["text"], str):
+        texts = [data["text"]]
+    elif "texts" in data and isinstance(data["texts"], list) and all(isinstance(t, str) for t in data["texts"]):
+        texts = data["texts"]
+    else:
+        return jsonify({"error": "Provide 'text' (string) or 'texts' (list of strings)"}), 400
+
+    # Basic validation
+    if len(texts) == 0 or any(len(t.strip()) == 0 for t in texts):
+        return jsonify({"error": "Texts must be non-empty strings"}), 400
+
+    # model selection: allow env override
+    EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OpenAI API key not configured on server"}), 500
+
+    # create client and call embeddings API using modern SDK
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+
+        resp = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=texts
+        )
+        # resp.data is a list of objects with .embedding
+        out = []
+        for i, item in enumerate(resp.data):
+            out.append({
+                "input": texts[i],
+                "embedding_length": len(item.embedding),
+                "embedding": item.embedding  # list of floats
+            })
+
+        return jsonify({
+            "model": EMBEDDING_MODEL,
+            "embeddings": out,
+            "count": len(out)
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": "OpenAI API error", "detail": str(e)}), 502
+
+# ========================================
 # Main entry point
 # ========================================
 if __name__ == "__main__":
