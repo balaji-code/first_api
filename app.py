@@ -3,8 +3,13 @@ import hashlib
 import time
 import os
 import json
+import math
+import sqlite3
+import re
+from typing import Dict, List
 
 import openai
+from openai import OpenAI
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, Response
@@ -778,6 +783,196 @@ def embed():
 
     except Exception as e:
         return jsonify({"error": "OpenAI API error", "detail": str(e)}), 502
+
+# ========================================
+# 11. RAG helper utilities + endpoints
+# ========================================
+
+VECTOR_DB = "vector_store.db"
+EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+MAX_CONTEXT_CHARS = 4000  # safe limit to attach to prompts
+
+# ---------- DB helpers ----------
+def ensure_db():
+    conn = sqlite3.connect(VECTOR_DB)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS docs (
+        id INTEGER PRIMARY KEY,
+        text TEXT NOT NULL,
+        embedding TEXT NOT NULL,   -- store JSON list
+        metadata TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_doc(text: str, embedding: List[float], metadata: Dict = None):
+    conn = sqlite3.connect(VECTOR_DB)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO docs (text, embedding, metadata) VALUES (?, ?, ?)",
+                (text, json.dumps(embedding), json.dumps(metadata or {})))
+    conn.commit()
+    conn.close()
+
+def load_all_embeddings():
+    conn = sqlite3.connect(VECTOR_DB)
+    cur = conn.cursor()
+    cur.execute("SELECT id, text, embedding, metadata FROM docs")
+    rows = cur.fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        result.append({
+            "id": r[0],
+            "text": r[1],
+            "embedding": json.loads(r[2]),
+            "metadata": json.loads(r[3])
+        })
+    return result
+
+# ---------- math helpers ----------
+def dot(a: List[float], b: List[float]) -> float:
+    return sum(x*y for x,y in zip(a,b))
+
+def norm(a: List[float]) -> float:
+    return math.sqrt(sum(x*x for x in a))
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    na = norm(a); nb = norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot(a,b) / (na*nb)
+
+# ---------- embedding helper ----------
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+    return [item.embedding for item in resp.data]
+
+# ---------- simple chunker ----------
+def chunk_text(text: str, chunk_size_words: int = 120, overlap_words: int = 20) -> List[str]:
+    # naive word-based chunker for readability (not token-accurate)
+    words = re.split(r"\s+", text.strip())
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = words[i:i+chunk_size_words]
+        chunks.append(" ".join(chunk))
+        i += (chunk_size_words - overlap_words)
+    return chunks
+
+# ensure DB exists on import
+ensure_db()
+
+# ---------- indexing endpoint ----------
+@app.route("/rag-index", methods=["POST"])
+def rag_index():
+    """
+    POST JSON:
+      {"id": "<optional id or slug>", "text": "<document text>", "metadata": {...} }
+    Splits document into chunks, embeds each chunk, stores in SQLite.
+    """
+    if not request.is_json:
+        return jsonify({"error":"JSON body required"}), 400
+    payload = request.get_json()
+    if "text" not in payload:
+        return jsonify({"error":"'text' field required"}), 400
+    text = payload["text"]
+    metadata = payload.get("metadata", {})
+    # split into chunks
+    chunks = chunk_text(text, chunk_size_words=120, overlap_words=20)
+    # embed chunks in batches
+    embeddings = []
+    try:
+        embeddings = embed_texts(chunks)
+    except Exception as e:
+        return jsonify({"error":"Embedding error","detail":str(e)}), 502
+    # save each chunk+embedding to DB with metadata (store parent id/slug if provided)
+    parent = payload.get("id")
+    for i, c in enumerate(chunks):
+        md = dict(metadata)
+        if parent:
+            md["_parent"] = parent
+        md["_chunk_index"] = i
+        save_doc(c, embeddings[i], md)
+    return jsonify({"status":"ok","chunks_indexed": len(chunks)}), 200
+
+# ---------- search + RAG query endpoint ----------
+@app.route("/rag-query", methods=["POST"])
+def rag_query():
+    """
+    POST JSON:
+      {"query":"...", "top_k": 3, "use_llm": true/false}
+    Returns top_k matching chunks and, if use_llm true, LLM-generated answer.
+    """
+    if not request.is_json:
+        return jsonify({"error":"JSON body required"}), 400
+    payload = request.get_json()
+    query = payload.get("query", "").strip()
+    if not query:
+        return jsonify({"error":"'query' required"}), 400
+    top_k = int(payload.get("top_k", 3))
+    use_llm = bool(payload.get("use_llm", True))
+
+    # embed query
+    try:
+        q_emb = embed_texts([query])[0]
+    except Exception as e:
+        return jsonify({"error":"Embedding error","detail":str(e)}), 502
+
+    # load all embeddings from DB and compute similarity (note: O(n) scan)
+    rows = load_all_embeddings()
+    scored = []
+    for r in rows:
+        score = cosine_similarity(q_emb, r["embedding"])
+        scored.append({"id": r["id"], "text": r["text"], "score": score, "metadata": r["metadata"]})
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    top = scored[:top_k]
+
+    result = {"query": query, "top_matches": top}
+
+    if use_llm:
+        # assemble context - join top texts (truncate to MAX_CONTEXT_CHARS)
+        context_parts = []
+        total = 0
+        for t in top:
+            txt = t["text"]
+            if total + len(txt) > MAX_CONTEXT_CHARS:
+                # truncate last piece if needed
+                remain = MAX_CONTEXT_CHARS - total
+                if remain <= 0:
+                    break
+                txt = txt[:remain]
+            context_parts.append(txt)
+            total += len(txt)
+        context = "\n\n---\n\n".join(context_parts)
+
+        system_prompt = (
+            "You are a helpful assistant. Use ONLY the context below to answer the user's question. "
+            "If the answer isn't contained in the context, say you don't know. Be concise."
+        )
+        user_prompt = f"CONTEXT:\n{context}\n\nQUESTION:\n{query}"
+
+        try:
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            ai_resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role":"system", "content": system_prompt},
+                    {"role":"user", "content": user_prompt}
+                ],
+                max_tokens=300,
+                temperature=0.0,
+                timeout=30
+            )
+            answer = ai_resp.choices[0].message.content.strip()
+            result["answer"] = answer
+        except Exception as e:
+            return jsonify({"error":"OpenAI API error","detail":str(e)}), 502
+
+    return jsonify(result), 200
+
 
 # ========================================
 # Main entry point
