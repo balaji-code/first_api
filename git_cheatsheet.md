@@ -96,3 +96,30 @@ alias gpl='git pull origin main'
 	•	Don’t force-push main unless absolutely alone and certain
 	•	Keep branches focused, small, and testable
 	•	Use PRs even when solo (they act as your history)
+
+# Start fresh
+git checkout main
+git pull origin main
+
+# Create feature branch
+git checkout -b feature/my-task
+
+# Work on your code ...
+# Then stage + commit
+git add .
+git commit -m "Finish my feature"
+
+# Push to GitHub
+git push origin feature/my-task
+
+# Create PR → Merge on GitHub
+
+# Update local main
+git checkout main
+git pull origin main
+
+# Delete merged branch locally
+git branch -d feature/my-task
+
+# Delete branch from GitHub (optional)
+git push origin --delete feature/my-task
