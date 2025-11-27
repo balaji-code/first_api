@@ -13,7 +13,8 @@ from openai import OpenAI
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, Response
-
+# Simple in-memory vector store
+RAG_STORE = []
 
 
 app = Flask(__name__)
@@ -972,6 +973,51 @@ def rag_query():
             return jsonify({"error":"OpenAI API error","detail":str(e)}), 502
 
     return jsonify(result), 200
+
+
+# ========================================
+# 12. /rag-docs – List all stored RAG documents
+# ========================================
+@app.route("/rag-docs", methods=["GET"])
+def rag_docs():
+    """
+    Return the list of indexed chunks from the SQLite vector store.
+    Query params:
+      - include_embeddings=true  -> returns the full embedding lists (large!)
+    """
+    include_embeddings = request.args.get("include_embeddings", "false").lower() in ("1", "true", "yes")
+
+    conn = sqlite3.connect(VECTOR_DB)
+    cur = conn.cursor()
+    cur.execute("SELECT id, text, embedding, metadata FROM docs ORDER BY id ASC")
+    rows = cur.fetchall()
+    conn.close()
+
+    docs = []
+    for r in rows:
+        emb_json = r[2]
+        # avoid loading full embeddings unless explicitly requested
+        embedding = json.loads(emb_json) if (emb_json and include_embeddings) else None
+        emb_len = len(json.loads(emb_json)) if emb_json else 0
+
+        metadata = {}
+        try:
+            metadata = json.loads(r[3]) if r[3] else {}
+        except Exception:
+            metadata = {"_raw_metadata": r[3]}
+
+        docs.append({
+            "id": r[0],
+            "text": r[1],
+            "embedding_length": emb_len,
+            "embedding": embedding,           # None by default (to keep response small)
+            "metadata": metadata
+        })
+
+    return jsonify({
+        "count": len(docs),
+        "chunks": docs
+    }), 200
 
 
 # ========================================
