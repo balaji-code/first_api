@@ -4,3 +4,4 @@ __pycache__/
 .env
 .DS_Store__pycache__/
 *.pyc
+vector_store.db
