@@ -1019,6 +1019,37 @@ def rag_docs():
         "chunks": docs
     }), 200
 
+# ========================================
+# 13. /rag-delete – Remove a stored chunk by id
+# ========================================
+@app.route("/rag-delete", methods=["POST"])
+def rag_delete():
+    data = request.json
+    if not data or "id" not in data:
+        return jsonify({"error": "Provide 'id' to delete"}), 400
+
+    chunk_id = data["id"]
+
+    try:
+        conn = sqlite3.connect("vector_store.db")
+        cur = conn.cursor()
+
+        # Check if exists
+        cur.execute("SELECT id FROM docs WHERE id = ?", (chunk_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "No such chunk ID"}), 404
+
+        # Delete
+        cur.execute("DELETE FROM docs WHERE id = ?", (chunk_id,))
+        conn.commit()
+        conn.close()
+
+        return jsonify({"status": "deleted", "id": chunk_id}), 200
+
+    except Exception as e:
+        return jsonify({"error": "delete failed", "detail": str(e)}), 500
 
 # ========================================
 # Main entry point
