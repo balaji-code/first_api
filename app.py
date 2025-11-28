@@ -899,79 +899,124 @@ def rag_index():
         save_doc(c, embeddings[i], md)
     return jsonify({"status":"ok","chunks_indexed": len(chunks)}), 200
 
-# ---------- search + RAG query endpoint ----------
+# ---------- search + RAG query endpoint (improved & safe) ----------
 @app.route("/rag-query", methods=["POST"])
 def rag_query():
     """
     POST JSON:
-      {"query":"...", "top_k": 3, "use_llm": true/false}
-    Returns top_k matching chunks and, if use_llm true, LLM-generated answer.
+      {
+        "query": "...",
+        "top_k": 3,
+        "use_llm": true/false
+      }
     """
+
+    # -------- Input validation --------
     if not request.is_json:
-        return jsonify({"error":"JSON body required"}), 400
+        return jsonify({"error": "JSON body required"}), 400
     payload = request.get_json()
+
     query = payload.get("query", "").strip()
     if not query:
-        return jsonify({"error":"'query' required"}), 400
+        return jsonify({"error": "'query' required"}), 400
+
+    # safer defaults
     top_k = int(payload.get("top_k", 3))
+    top_k = max(1, min(top_k, 10))   # cap between 1 and 10
     use_llm = bool(payload.get("use_llm", True))
 
-    # embed query
+    # -------- Embed query --------
     try:
         q_emb = embed_texts([query])[0]
     except Exception as e:
-        return jsonify({"error":"Embedding error","detail":str(e)}), 502
+        return jsonify({"error": "Embedding error", "detail": str(e)}), 502
 
-    # load all embeddings from DB and compute similarity (note: O(n) scan)
+    # -------- Load all stored embeddings --------
     rows = load_all_embeddings()
+    if not rows:
+        return jsonify({"query": query, "top_matches": [], "answer": "No documents indexed"}), 200
+
+    # -------- Compute cosine similarity --------
     scored = []
     for r in rows:
-        score = cosine_similarity(q_emb, r["embedding"])
-        scored.append({"id": r["id"], "text": r["text"], "score": score, "metadata": r["metadata"]})
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    top = scored[:top_k]
-
-    result = {"query": query, "top_matches": top}
-
-    if use_llm:
-        # assemble context - join top texts (truncate to MAX_CONTEXT_CHARS)
-        context_parts = []
-        total = 0
-        for t in top:
-            txt = t["text"]
-            if total + len(txt) > MAX_CONTEXT_CHARS:
-                # truncate last piece if needed
-                remain = MAX_CONTEXT_CHARS - total
-                if remain <= 0:
-                    break
-                txt = txt[:remain]
-            context_parts.append(txt)
-            total += len(txt)
-        context = "\n\n---\n\n".join(context_parts)
-
-        system_prompt = (
-            "You are a helpful assistant. Use ONLY the context below to answer the user's question. "
-            "If the answer isn't contained in the context, say you don't know. Be concise."
-        )
-        user_prompt = f"CONTEXT:\n{context}\n\nQUESTION:\n{query}"
-
+        emb = r.get("embedding")
+        if not emb:
+            continue  # skip any chunk missing embeddings
         try:
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            ai_resp = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role":"system", "content": system_prompt},
-                    {"role":"user", "content": user_prompt}
-                ],
-                max_tokens=300,
-                temperature=0.0,
-                timeout=30
-            )
-            answer = ai_resp.choices[0].message.content.strip()
-            result["answer"] = answer
-        except Exception as e:
-            return jsonify({"error":"OpenAI API error","detail":str(e)}), 502
+            score = cosine_similarity(q_emb, emb)
+        except Exception:
+            continue
+        scored.append({
+            "id": r["id"],
+            "text": r["text"],
+            "metadata": r.get("metadata", {}),
+            "score": float(score)
+        })
 
+    if not scored:
+        return jsonify({"query": query, "top_matches": [], "answer": "No valid embeddings found"}), 200
+
+    # sort high → low
+    scored.sort(key=lambda x: x["score"], reverse=True)
+
+    # threshold to filter noise
+    MIN_SCORE = 0.12
+    top = [s for s in scored if s["score"] >= MIN_SCORE][:top_k]
+
+    result = {
+        "query": query,
+        "top_matches": top
+    }
+
+    # -------- If no relevant documents found --------
+    if not top:
+        result["answer"] = "I don't know (no relevant documents match)."
+        return jsonify(result), 200
+
+    # -------- If the user does NOT want LLM answer --------
+    if not use_llm:
+        return jsonify(result), 200
+
+    # -------- Build context (simple truncation) --------
+    MAX_CONTEXT_CHARS = 4000  # safe for your current model
+    parts = []
+    total = 0
+
+    for t in top:
+        txt = t["text"]
+        if total + len(txt) > MAX_CONTEXT_CHARS:
+            remain = MAX_CONTEXT_CHARS - total
+            if remain <= 0:
+                break
+            txt = txt[:remain]
+        parts.append(txt)
+        total += len(txt)
+
+    context = "\n\n---\n\n".join(parts)
+
+    # -------- LLM answer --------
+    system_prompt = (
+        "You are a helpful assistant. Use ONLY the provided context to answer. "
+        "If the answer is not in the context, say you don't know. Be concise."
+    )
+    user_prompt = f"CONTEXT:\n{context}\n\nQUESTION:\n{query}"
+
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        ai_resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=300,
+            temperature=0.0
+        )
+        answer = ai_resp.choices[0].message.content.strip()
+    except Exception as e:
+        return jsonify({"error": "OpenAI API error", "detail": str(e)}), 502
+
+    result["answer"] = answer
     return jsonify(result), 200
 
 
