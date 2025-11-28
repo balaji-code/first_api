@@ -15,7 +15,8 @@ from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify, Response
 # Simple in-memory vector store
 RAG_STORE = []
-
+# Minimum cosine similarity required to treat a chunk as relevant
+MIN_SCORE = 0.25
 
 app = Flask(__name__)
 # ensure Flask's JSON responses do not escape non-ascii characters
@@ -1095,6 +1096,70 @@ def rag_delete():
 
     except Exception as e:
         return jsonify({"error": "delete failed", "detail": str(e)}), 500
+
+@app.route("/rag-search", methods=["POST"])
+def rag_search():
+    """
+    Simple RAG retrieval (no LLM).
+    POST JSON:
+      {"query":"...", "top_k": 3, "metadata":{"topic":"computers"}}
+    Returns top_k chunks with score >= MIN_SCORE.
+    """
+    if not request.is_json:
+        return jsonify({"error":"JSON body required"}), 400
+
+    payload = request.get_json()
+    query = payload.get("query","").strip()
+    if not query:
+        return jsonify({"error":"'query' required"}), 400
+
+    top_k = max(1, min(int(payload.get("top_k",3)), 20))
+    metadata_filter = payload.get("metadata", {})
+
+    # 1. Embed query
+    try:
+        q_emb = embed_texts([query])[0]
+    except Exception as e:
+        return jsonify({"error":"Embedding error","detail":str(e)}), 502
+
+    # 2. Load DB rows and score
+    rows = load_all_embeddings()
+    scored = []
+
+    for r in rows:
+        emb = r.get("embedding")
+        if not emb:
+            continue
+
+        md = r.get("metadata", {}) or {}
+
+        # 3. Optional metadata filtering
+        ok = True
+        if isinstance(metadata_filter, dict):
+            for k,v in metadata_filter.items():
+                if md.get(k) != v:
+                    ok = False
+                    break
+        if not ok:
+            continue
+
+        score = cosine_similarity(q_emb, emb)
+        scored.append({
+            "id": r["id"],
+            "text": r["text"],
+            "metadata": md,
+            "score": float(score)
+        })
+
+    # 4. Sort and enforce MIN_SCORE
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    top_matches = [s for s in scored if s["score"] >= MIN_SCORE][:top_k]
+
+    return jsonify({
+        "query": query,
+        "top_matches": top_matches,
+        "count_scored": len(scored)
+    }), 200
 
 # ========================================
 # Main entry point
