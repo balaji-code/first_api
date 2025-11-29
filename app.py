@@ -62,6 +62,8 @@ def hello():
     return jsonify({"message": "Hello from your API", "status": "ok"}), 200
 
 # POST endpoint that echoes back the received JSON
+
+
 @app.route("/echo", methods=["POST"])
 def echo():
     """Echo back validated JSON payload."""
@@ -69,13 +71,13 @@ def echo():
     # 1. JSON must exist
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 400
-    
+
     data = request.get_json()
 
     # 2. Must contain the key "name"
     if "name" not in data:
         return jsonify({"error": "'name' field is required"}), 400
-    
+
     # 3. Must be a string
     if not isinstance(data["name"], str):
         return jsonify({"error": "'name' must be a string"}), 400
@@ -85,6 +87,7 @@ def echo():
         "received": data,
         "message": "Valid input received",
     }), 200
+
 
 @app.route("/summarize", methods=["POST"])
 def summarize():
@@ -148,6 +151,7 @@ def summarize():
             return jsonify({"error": "OpenAI API error", "detail": str(e)}), 502
         return jsonify({"error": "Server error", "detail": str(e)}), 500
 
+
 @app.route("/keywords", methods=["POST"])
 def keywords():
     """Extract up to 5 important keywords from the text."""
@@ -207,7 +211,8 @@ def keywords():
         except Exception:
             raw = resp["choices"][0]["message"]["content"].strip()
 
-        import json, re
+        import json
+        import re
         m = re.search(r'(\[.*?\])', raw, flags=re.S)
         if m:
             arr_text = m.group(1)
@@ -228,6 +233,7 @@ def keywords():
 
     except Exception as e:
         return jsonify({"error": "Server error", "detail": str(e)}), 500
+
 
 @app.route("/sentiment", methods=["POST"])
 def sentiment():
@@ -294,7 +300,8 @@ def sentiment():
             raw = resp["choices"][0]["message"]["content"].strip()
 
         # Try to parse JSON from model output
-        import json, re
+        import json
+        import re
         m = re.search(r'(\{.*\})', raw, flags=re.S)
         if m:
             obj_text = m.group(1)
@@ -429,7 +436,7 @@ def rewrite():
     # Validate JSON input
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 400
-    
+
     data = request.get_json()
 
     if "text" not in data:
@@ -487,7 +494,6 @@ def translate():
 
     text = data["text"]
     to_lang = data["to"].strip()
-    
     if not isinstance(text, str) or text.strip() == "":
         return jsonify({"error": "'text' must be a non-empty string"}), 400
     if not isinstance(to_lang, str) or to_lang == "":
@@ -790,11 +796,14 @@ def embed():
 # 11. RAG helper utilities + endpoints
 # ========================================
 
+
 VECTOR_DB = "vector_store.db"
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 MAX_CONTEXT_CHARS = 4000  # safe limit to attach to prompts
 
 # ---------- DB helpers ----------
+
+
 def ensure_db():
     conn = sqlite3.connect(VECTOR_DB)
     cur = conn.cursor()
@@ -809,6 +818,7 @@ def ensure_db():
     conn.commit()
     conn.close()
 
+
 def save_doc(text: str, embedding: List[float], metadata: Dict = None):
     conn = sqlite3.connect(VECTOR_DB)
     cur = conn.cursor()
@@ -816,6 +826,7 @@ def save_doc(text: str, embedding: List[float], metadata: Dict = None):
                 (text, json.dumps(embedding), json.dumps(metadata or {})))
     conn.commit()
     conn.close()
+
 
 def load_all_embeddings():
     conn = sqlite3.connect(VECTOR_DB)
@@ -834,25 +845,34 @@ def load_all_embeddings():
     return result
 
 # ---------- math helpers ----------
+
+
 def dot(a: List[float], b: List[float]) -> float:
-    return sum(x*y for x,y in zip(a,b))
+    return sum(x*y for x, y in zip(a, b))
+
 
 def norm(a: List[float]) -> float:
     return math.sqrt(sum(x*x for x in a))
 
+
 def cosine_similarity(a: List[float], b: List[float]) -> float:
-    na = norm(a); nb = norm(b)
+    na = norm(a)
+    nb = norm(b)
     if na == 0 or nb == 0:
         return 0.0
-    return dot(a,b) / (na*nb)
+    return dot(a, b) / (na*nb)
 
 # ---------- embedding helper ----------
+
+
 def embed_texts(texts: List[str]) -> List[List[float]]:
     client = OpenAI(api_key=OPENAI_API_KEY)
     resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
     return [item.embedding for item in resp.data]
 
 # ---------- simple chunker ----------
+
+
 def chunk_text(text: str, chunk_size_words: int = 120, overlap_words: int = 20) -> List[str]:
     # naive word-based chunker for readability (not token-accurate)
     words = re.split(r"\s+", text.strip())
@@ -865,9 +885,13 @@ def chunk_text(text: str, chunk_size_words: int = 120, overlap_words: int = 20) 
     return chunks
 
 # ensure DB exists on import
+
+
 ensure_db()
 
 # ---------- indexing endpoint ----------
+
+
 @app.route("/rag-index", methods=["POST"])
 def rag_index():
     """
@@ -876,10 +900,10 @@ def rag_index():
     Splits document into chunks, embeds each chunk, stores in SQLite.
     """
     if not request.is_json:
-        return jsonify({"error":"JSON body required"}), 400
+        return jsonify({"error": "JSON body required"}), 400
     payload = request.get_json()
     if "text" not in payload:
-        return jsonify({"error":"'text' field required"}), 400
+        return jsonify({"error": "'text' field required"}), 400
     text = payload["text"]
     metadata = payload.get("metadata", {})
     # split into chunks
@@ -889,7 +913,7 @@ def rag_index():
     try:
         embeddings = embed_texts(chunks)
     except Exception as e:
-        return jsonify({"error":"Embedding error","detail":str(e)}), 502
+        return jsonify({"error": "Embedding error", "detail": str(e)}), 502
     # save each chunk+embedding to DB with metadata (store parent id/slug if provided)
     parent = payload.get("id")
     for i, c in enumerate(chunks):
@@ -898,9 +922,11 @@ def rag_index():
             md["_parent"] = parent
         md["_chunk_index"] = i
         save_doc(c, embeddings[i], md)
-    return jsonify({"status":"ok","chunks_indexed": len(chunks)}), 200
+    return jsonify({"status": "ok", "chunks_indexed": len(chunks)}), 200
 
 # ---------- search + RAG query endpoint (improved & safe) ----------
+
+
 @app.route("/rag-query", methods=["POST"])
 def rag_query():
     """
@@ -1065,6 +1091,7 @@ def rag_docs():
         "chunks": docs
     }), 200
 
+
 # ========================================
 # 13. /rag-delete – Remove a stored chunk by id
 # ========================================
@@ -1097,6 +1124,7 @@ def rag_delete():
     except Exception as e:
         return jsonify({"error": "delete failed", "detail": str(e)}), 500
 
+
 @app.route("/rag-search", methods=["POST"])
 def rag_search():
     """
@@ -1106,21 +1134,21 @@ def rag_search():
     Returns top_k chunks with score >= MIN_SCORE.
     """
     if not request.is_json:
-        return jsonify({"error":"JSON body required"}), 400
+        return jsonify({"error": "JSON body required"}), 400
 
     payload = request.get_json()
-    query = payload.get("query","").strip()
+    query = payload.get("query", "").strip()
     if not query:
-        return jsonify({"error":"'query' required"}), 400
+        return jsonify({"error": "'query' required"}), 400
 
-    top_k = max(1, min(int(payload.get("top_k",3)), 20))
+    top_k = max(1, min(int(payload.get("top_k", 3)), 20))
     metadata_filter = payload.get("metadata", {})
 
     # 1. Embed query
     try:
         q_emb = embed_texts([query])[0]
     except Exception as e:
-        return jsonify({"error":"Embedding error","detail":str(e)}), 502
+        return jsonify({"error": "Embedding error", "detail": str(e)}), 502
 
     # 2. Load DB rows and score
     rows = load_all_embeddings()
@@ -1136,7 +1164,7 @@ def rag_search():
         # 3. Optional metadata filtering
         ok = True
         if isinstance(metadata_filter, dict):
-            for k,v in metadata_filter.items():
+            for k, v in metadata_filter.items():
                 if md.get(k) != v:
                     ok = False
                     break
@@ -1160,6 +1188,120 @@ def rag_search():
         "top_matches": top_matches,
         "count_scored": len(scored)
     }), 200
+
+# ---------- /rag-upsert endpoint ----------
+
+
+RAG_DB = os.getenv("RAG_DB_PATH", "vector_store.db")  # adjust if your DB path differs
+
+
+def simple_chunk_text(text: str, max_chars: int = 800, overlap: int = 100) -> List[str]:
+    """
+    Create chunks by sentence boundaries, then join until max_chars.
+    Overlap keeps context between chunks.
+    """
+    # naive sentence split (good enough for English)
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    chunks = []
+    current = []
+    current_len = 0
+    for s in sentences:
+        if current_len + len(s) + 1 <= max_chars:
+            current.append(s)
+            current_len += len(s) + 1
+        else:
+            if current:
+                chunks.append(" ".join(current).strip())
+            # start new chunk, but allow overlap
+            # take last N chars from previous if available
+            overlap_text = ""
+            if chunks and overlap > 0:
+                prev = chunks[-1]
+                overlap_text = prev[-overlap:] if len(prev) > overlap else prev
+            current = [overlap_text, s] if overlap_text else [s]
+            current_len = sum(len(x) for x in current) + len(current) - 1
+    if current:
+        chunks.append(" ".join(current).strip())
+    # final cleanup: remove empty chunks
+    return [c for c in chunks if c]
+
+
+@app.route("/rag-upsert", methods=["POST"])
+def rag_upsert():
+    """
+    Upsert a document:
+    POST JSON:
+      {
+         "id": "<doc-id>",
+         "text": "<full document text>",
+         "metadata": {...}   # optional
+      }
+    Behavior:
+      - If doc-id exists, delete its old chunks
+      - Chunk the provided text, embed, and insert new chunks
+    """
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+    payload = request.get_json()
+
+    doc_id = payload.get("id", "").strip()
+    text = payload.get("text", "").strip()
+    metadata = payload.get("metadata", {}) or {}
+
+    if not doc_id:
+        return jsonify({"error": "'id' required"}), 400
+    if not text:
+        return jsonify({"error": "'text' required"}), 400
+
+    # attach parent info into metadata for provenance
+    metadata["_parent"] = doc_id
+
+    # 1) Delete existing rows for this parent document (safe idempotent behavior)
+    try:
+        conn = sqlite3.connect(RAG_DB)
+        cur = conn.cursor()
+        # We expect metadata stored as JSON text in a column named "metadata".
+        # This SQL deletes rows where metadata contains the parent's id marker.
+        # If your schema stores parent in a dedicated column, change this query accordingly.
+        cur.execute("DELETE FROM chunks WHERE metadata LIKE ?", ('%\"_parent\":\"' + doc_id + '\"%',))
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.close()
+        return jsonify({"error": "DB delete error", "detail": str(e)}), 500
+
+    # 2) Chunk the new text
+    chunks = simple_chunk_text(text, max_chars=800, overlap=100)
+    if not chunks:
+        return jsonify({"error": "No chunks created from text"}), 400
+
+    # 3) Create embeddings for all chunks
+    try:
+        embeddings = embed_texts(chunks)  # uses your existing helper
+    except Exception as e:
+        return jsonify({"error": "Embedding error", "detail": str(e)}), 502
+
+    # 4) Insert new chunk rows
+    try:
+        # We'll insert rows with fields similar to your existing table:
+        # id (auto), text, embedding (JSON), embedding_length, metadata (JSON), _chunk_index
+        for idx, (chunk_text, emb) in enumerate(zip(chunks, embeddings)):
+            md = dict(metadata)  # copy
+            md["_chunk_index"] = idx
+            # store embedding as JSON list if your schema expects that; adjust if you store blobs.
+            cur.execute(
+                "INSERT INTO chunks (text, embedding, embedding_length, metadata) VALUES (?, ?, ?, ?)",
+                (chunk_text, json.dumps(emb), len(emb) if hasattr(emb, "__len__") else None, json.dumps(md))
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        if conn:
+            conn.close()
+        return jsonify({"error": "DB insert error", "detail": str(e)}), 500
+
+    return jsonify({"status": "ok", "id": doc_id, "chunks_indexed": len(chunks)}), 200
+
 
 # ========================================
 # Main entry point
