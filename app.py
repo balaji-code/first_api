@@ -31,7 +31,9 @@ import hashlib
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from openai import OpenAI
-
+import faiss
+import numpy as np
+import pickle
 # Load environment variables from .env if present (convenient for local dev)
 load_dotenv()
 
@@ -210,10 +212,107 @@ def load_all_embeddings() -> List[Dict]:
         out.append({"id": _id, "text": text, "embedding": emb, "metadata": md})
     return out
 
+# ---------- FAISS index helpers ----------
+FAISS_INDEX_PATH = os.path.join(BASE_DIR, "vector_store.faiss")
+FAISS_IDMAP_PATH = os.path.join(BASE_DIR, "faiss_idmap.pickle")
+VECTOR_DIM = 1536  # must match embedding model
 
+# In-memory structures
+_faiss_index = None
+_id_to_rowid = {}   # map faiss internal id -> DB row id (int)
+
+def init_faiss_index():
+    global _faiss_index, _id_to_rowid
+    # If persisted index exists, try to load it
+    if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(FAISS_IDMAP_PATH):
+        try:
+            _faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+            with open(FAISS_IDMAP_PATH, "rb") as f:
+                _id_to_rowid = pickle.load(f)
+            print("DEBUG: Loaded FAISS index from disk, entries:", len(_id_to_rowid))
+            return
+        except Exception as e:
+            print("DEBUG: Failed to load persisted FAISS index:", e)
+
+    # otherwise create a fresh Flat index (simple)
+    _faiss_index = faiss.IndexFlatIP(VECTOR_DIM)  # use inner product for cosine if vectors are normalized
+    _id_to_rowid = {}
+    rebuild_faiss_index()  # populate from DB
+
+def rebuild_faiss_index():
+    """Read embeddings from DB and (re)build FAISS and id map."""
+    global _faiss_index, _id_to_rowid
+    rows = load_all_embeddings()
+    vecs = []
+    ids = []
+    for r in rows:
+        emb = r.get("embedding")
+        if not emb:
+            continue
+        # convert to float32 numpy
+        arr = np.array(emb, dtype="float32")
+        # If using IP similarity for cosine, normalize first:
+        norm = np.linalg.norm(arr)
+        if norm > 0:
+            arr = arr / norm
+        vecs.append(arr)
+        ids.append(r["id"])
+    if vecs:
+        xb = np.vstack(vecs)
+        # recreate index and add data
+        _faiss_index = faiss.IndexFlatIP(VECTOR_DIM)
+        _faiss_index.add(xb)
+        # create id map mapping internal index position -> DB row id
+        _id_to_rowid = {i: ids[i] for i in range(len(ids))}
+    else:
+        _faiss_index = faiss.IndexFlatIP(VECTOR_DIM)
+        _id_to_rowid = {}
+    persist_faiss_index()
+
+def persist_faiss_index():
+    """Save index + id map to disk."""
+    try:
+        faiss.write_index(_faiss_index, FAISS_INDEX_PATH)
+        with open(FAISS_IDMAP_PATH, "wb") as f:
+            pickle.dump(_id_to_rowid, f)
+    except Exception as e:
+        print("DEBUG: persist_faiss_index error:", e)
+
+def add_vector_to_faiss(db_row_id: int, emb: List[float]):
+    """Append a single vector to FAISS and map its index -> db_row_id."""
+    global _faiss_index, _id_to_rowid
+    arr = np.array(emb, dtype="float32")
+    norm = np.linalg.norm(arr)
+    if norm > 0:
+        arr = arr / norm
+    arr = arr.reshape(1, -1)
+    # FAISS IndexFlatIP does not support ids; we append and map by position
+    _faiss_index.add(arr)
+    new_pos = int(_faiss_index.ntotal) - 1
+    _id_to_rowid[new_pos] = db_row_id
+    persist_faiss_index()
+
+def search_faiss_by_vector(query_emb: List[float], top_k: int = 5):
+    """Return list of tuples (db_row_id, score)."""
+    global _faiss_index, _id_to_rowid
+    if _faiss_index is None or _faiss_index.ntotal == 0:
+        return []
+    q = np.array(query_emb, dtype="float32")
+    norm = np.linalg.norm(q)
+    if norm > 0:
+        q = q / norm
+    q = q.reshape(1, -1)
+    D, I = _faiss_index.search(q, top_k)  # D: distances/scores, I: positions
+    out = []
+    for score, pos in zip(D[0], I[0]):
+        if pos < 0:
+            continue
+        db_id = _id_to_rowid.get(int(pos))
+        out.append((db_id, float(score)))
+    return out
 # Make sure DB exists when module is imported/run
 ensure_db()
-
+init_faiss_index()
 # -----------------------------
 # Small utility endpoints
 # -----------------------------
@@ -411,13 +510,28 @@ def upsert_document_to_db(doc_id: str, text: str, metadata: Dict, max_chars: int
     except Exception as e:
         conn.close()
         return False, f"Embedding error: {e}"
+    inserted_row_ids = []
     try:
         for idx, (chunk_text, emb) in enumerate(zip(chunks, embeddings)):
             md = dict(metadata or {})
             md['_parent'] = doc_id
             md['_chunk_index'] = idx
-            cur.execute("INSERT INTO docs (text, embedding, metadata) VALUES (?, ?, ?)", (chunk_text, json.dumps(emb), json.dumps(md)))
+            cur.execute(
+                "INSERT INTO docs (text, embedding, metadata) VALUES (?, ?, ?)",
+                (chunk_text, json.dumps(emb), json.dumps(md))
+            )
+            # get DB row id of the inserted chunk
+            row_id = cur.lastrowid
+            inserted_row_ids.append((row_id, emb))
+        # commit once for the batch
         conn.commit()
+        # Now add vectors to FAISS (do this after DB commit)
+        for row_id, emb in inserted_row_ids:
+            try:
+                add_vector_to_faiss(row_id, emb)
+            except Exception as e:
+                # don't fail the whole upsert on faiss add error; surface debug output
+                print("DEBUG: add_vector_to_faiss failed for row", row_id, ":", e)
         conn.close()
         return True, len(chunks)
     except Exception as e:
@@ -512,14 +626,32 @@ def rag_search():
         q_emb = embed_texts([query])[0]
     except Exception as e:
         return jsonify({"error": "Embedding error", "detail": str(e)}), 502
-    rows = load_all_embeddings()
-    scored = []
-    for r in rows:
-        emb = r.get('embedding')
-        if not emb:
+    # 2. Use FAISS to get the top candidate DB row ids + scores
+    try:
+        faiss_hits = search_faiss_by_vector(q_emb, top_k=top_k)
+    except Exception as e:
+        return jsonify({"error": "FAISS search error", "detail": str(e)}), 502
+
+    top_matches = []
+    conn = sqlite3.connect(RAG_DB)
+    cur = conn.cursor()
+    count_scored = 0
+    for db_row_id, score in faiss_hits:
+        count_scored += 1
+        # metadata filter
+        try:
+            cur.execute("SELECT id, text, metadata FROM docs WHERE id = ?", (db_row_id,))
+            row = cur.fetchone()
+        except Exception:
+            row = None
+        if not row:
             continue
-        md = r.get('metadata', {}) or {}
-        # metadata filter: each key must match exactly
+        _id, text, md_json = row
+        try:
+            md = json.loads(md_json) if md_json else {}
+        except Exception:
+            md = {"_raw_metadata": md_json}
+        # apply metadata filter
         ok = True
         if isinstance(metadata_filter, dict):
             for k, v in metadata_filter.items():
@@ -528,11 +660,15 @@ def rag_search():
                     break
         if not ok:
             continue
-        score = cosine_similarity(q_emb, emb)
-        scored.append({"id": r['id'], "text": r['text'], "metadata": md, "score": float(score)})
-    scored.sort(key=lambda x: x['score'], reverse=True)
-    top_matches = [s for s in scored if s['score'] >= MIN_SCORE][:top_k]
-    return jsonify({"query": query, "top_matches": top_matches, "count_scored": len(scored)}), 200
+        # enforce MIN_SCORE threshold
+        if score < MIN_SCORE:
+            continue
+        top_matches.append({"id": _id, "text": text, "metadata": md, "score": float(score)})
+        if len(top_matches) >= top_k:
+            break
+    conn.close()
+    # done — top_matches already sorted by FAISS score
+    return jsonify({"query": query, "top_matches": top_matches, "count_scored": count_scored}), 200
 
 
 @app.route('/rag-query', methods=['POST'])
@@ -549,16 +685,34 @@ def rag_query():
         q_emb = embed_texts([query])[0]
     except Exception as e:
         return jsonify({"error": "Embedding error", "detail": str(e)}), 502
-    rows = load_all_embeddings()
-    scored = []
-    for r in rows:
-        emb = r.get('embedding')
-        if not emb:
+    # Use FAISS to get candidate docs
+    try:
+        faiss_hits = search_faiss_by_vector(q_emb, top_k=top_k*2)  # fetch a few extra for metadata filtering
+    except Exception as e:
+        return jsonify({"error": "FAISS search error", "detail": str(e)}), 502
+
+    rows = []
+    conn = sqlite3.connect(RAG_DB)
+    cur = conn.cursor()
+    for db_row_id, score in faiss_hits:
+        try:
+            cur.execute("SELECT id, text, metadata FROM docs WHERE id = ?", (db_row_id,))
+            row = cur.fetchone()
+        except Exception:
+            row = None
+        if not row:
             continue
-        score = cosine_similarity(q_emb, emb)
-        scored.append({"id": r['id'], "text": r['text'], "metadata": r.get('metadata', {}), "score": float(score)})
-    scored.sort(key=lambda x: x['score'], reverse=True)
-    top = [s for s in scored if s['score'] >= MIN_SCORE][:top_k]
+        _id, text, md_json = row
+        try:
+            md = json.loads(md_json) if md_json else {}
+        except Exception:
+            md = {"_raw_metadata": md_json}
+        rows.append({"id": _id, "text": text, "metadata": md, "score": float(score)})
+    conn.close()
+
+    # sort by FAISS score (already in that order) and apply MIN_SCORE
+    rows.sort(key=lambda x: x["score"], reverse=True)
+    top = [r for r in rows if r["score"] >= MIN_SCORE][:top_k]
     result = {"query": query, "top_matches": top}
     if not top:
         result['answer'] = "I don't know (no relevant documents match)."
