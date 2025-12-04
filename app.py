@@ -45,7 +45,11 @@ RAG_DB = os.getenv("RAG_DB") or os.path.join(BASE_DIR, "vector_store.db")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-
+CHUNKER_MODE = os.getenv("RAG_CHUNKER", "semantic").lower()
+try:
+    CHUNK_SIM_THRESHOLD = float(os.getenv("CHUNK_SIM_THRESHOLD", "0.55"))
+except Exception:
+    CHUNK_SIM_THRESHOLD = 0.55
 # Minimum similarity threshold used by RAG endpoints (can be set in .env as RAG_MIN_SCORE)
 try:
     MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.12"))
@@ -157,7 +161,87 @@ def simple_chunk_text(text: str, max_chars: int = 800, overlap: int = 100) -> Li
         chunks.append(' '.join(current).strip())
     return [c for c in chunks if c]
 
+def semantic_chunk_text(text: str, max_chars: int = 1200, overlap: int = 100,
+                        sim_threshold: float = 0.55) -> List[str]:
+    """
+    Split text into sentences, then merge adjacent sentences when semantically similar.
+    Added debug logging to show per-sentence similarities and merge decisions.
+    - max_chars: cap chunk length (if merged chunk grows beyond this, force split)
+    - overlap: unused here (kept for API parity)
+    - sim_threshold: cosine similarity threshold for merging (0-1)
 
+    Returns list[str] chunks.
+    """
+    # 1) Sentence-split (same as before)
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s.strip()]
+    if not sentences:
+        return []
+
+    # 2) Embed all sentences in one batch
+    try:
+        sent_embs = embed_texts(sentences)  # [[...], [...], ...]
+    except Exception as e:
+        # fallback to returning simple sentence chunks if embedding fails
+        print("DEBUG: semantic_chunk_text embedding failed:", e)
+        return sentences
+
+    # 3) Build chunks by merging adjacent sentences with similarity to current centroid
+    chunks = []
+    current_sentences = [sentences[0]]
+    current_vecs = [np.array(sent_embs[0], dtype="float32")]
+    current_len = len(current_sentences[0])
+
+    # debug header
+    print(f"DEBUG: semantic_chunk_text: {len(sentences)} sentences, sim_threshold={sim_threshold}")
+
+    for i in range(1, len(sentences)):
+        s = sentences[i]
+        v = np.array(sent_embs[i], dtype="float32")
+
+        # centroid of current chunk
+        centroid = np.mean(np.stack(current_vecs, axis=0), axis=0)
+        # normalize for cosine
+        cn = np.linalg.norm(centroid)
+        vn = np.linalg.norm(v)
+        sim = 0.0
+        if cn > 0 and vn > 0:
+            sim = float(np.dot(centroid, v) / (cn * vn))
+
+        # decide whether to merge
+        will_merge = (sim >= sim_threshold) and (current_len + len(s) + 1 <= max_chars)
+        print(f"DEBUG: sent[{i}] preview='{s[:60]}', sim={sim:.4f}, current_len={current_len}, will_merge={will_merge}")
+
+        if will_merge:
+            current_sentences.append(s)
+            current_vecs.append(v)
+            current_len += len(s) + 1
+        else:
+            # finalize current chunk
+            finalized = " ".join(current_sentences).strip()
+            print(f"DEBUG: finalizing chunk (len={len(finalized)}) preview='{finalized[:80]}'")
+            chunks.append(finalized)
+            # start new chunk
+            current_sentences = [s]
+            current_vecs = [v]
+            current_len = len(s)
+
+    # append final chunk
+    if current_sentences:
+        final = " ".join(current_sentences).strip()
+        print(f"DEBUG: final chunk (len={len(final)}) preview='{final[:80]}'")
+        chunks.append(final)
+
+    return chunks
+
+def choose_chunker(text, max_chars=800, overlap=100):
+    """
+    Wrapper that chooses the chunker based on CHUNKER_MODE.
+    - 'semantic'  → semantic_chunk_text using CHUNK_SIM_THRESHOLD
+    - 'simple'    → simple_chunk_text
+    """
+    if CHUNKER_MODE == "semantic":
+        return semantic_chunk_text(text, max_chars=max_chars, overlap=overlap, sim_threshold=CHUNK_SIM_THRESHOLD)
+    return simple_chunk_text(text, max_chars=max_chars, overlap=overlap)
 # -----------------------------
 # SQLite helpers (single 'docs' table used by RAG)
 # -----------------------------
@@ -471,7 +555,8 @@ def rag_index():
         return jsonify({"error": "'text' required"}), 400
     parent = payload.get('id')
     metadata = payload.get('metadata', {}) or {}
-    chunks = simple_chunk_text(text, max_chars=int(payload.get('max_chars', 800)), overlap=int(payload.get('overlap', 100)))
+    chunks = choose_chunker(text, max_chars=int(payload.get('max_chars', 800)),
+                        overlap=int(payload.get('overlap', 100)))
     try:
         embeddings = embed_texts(chunks)
     except Exception as e:
@@ -501,7 +586,7 @@ def upsert_document_to_db(doc_id: str, text: str, metadata: Dict, max_chars: int
         conn.close()
         return False, f"DB delete error: {e}"
 
-    chunks = simple_chunk_text(text, max_chars=max_chars, overlap=overlap)
+    chunks = choose_chunker(text, max_chars=max_chars, overlap=overlap)
     if not chunks:
         conn.close()
         return False, "No chunks created from text"
