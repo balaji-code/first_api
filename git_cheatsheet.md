@@ -123,3 +123,10 @@ git branch -d feature/my-task
 
 # Delete branch from GitHub (optional)
 git push origin --delete feature/my-task
+
+# important curl commands
+for id in $(curl -s http://127.0.0.1:5050/rag-docs | jq '.chunks[] | select(.metadata._parent=="mixed-1") | .id'); do
+  echo "Deleting chunk ID: $id"
+  curl -s -X POST http://127.0.0.1:5050/rag-delete -H "Content-Type: application/json" --data "{\"id\":$id}"
+  echo
+done
