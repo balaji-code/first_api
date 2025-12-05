@@ -45,6 +45,7 @@ RAG_DB = os.getenv("RAG_DB") or os.path.join(BASE_DIR, "vector_store.db")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+RERANK_MODEL = os.getenv("RERANK_MODEL", OPENAI_MODEL)
 CHUNKER_MODE = os.getenv("RAG_CHUNKER", "semantic").lower()
 try:
     CHUNK_SIM_THRESHOLD = float(os.getenv("CHUNK_SIM_THRESHOLD", "0.55"))
@@ -444,7 +445,215 @@ def call_chat_with_system(system_prompt: str, user_prompt: str, max_tokens: int 
     except Exception:
         # older style accessibility
         return resp["choices"][0]["message"]["content"].strip()
+# -----------------------------
+# Reranker helpers (LLM-based)
+# -----------------------------
+import math
 
+
+def extract_first_json_array(text: str) -> str | None:
+    """Return the first JSON array substring (including brackets) found in text.
+    This does a simple bracket-depth scan to avoid greedy regex matches.
+    Returns None if no complete array is found.
+    """
+    start = text.find('[')
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1]
+    return None
+
+
+def lexical_overlap_score(query: str, passage: str) -> float:
+    """Simple normalized token overlap between query and passage (0..1).
+    This is a cheap signal to penalize candidates that lack lexical overlap.
+    """
+    q_words = set(re.findall(r"\w+", query.lower()))
+    p_words = set(re.findall(r"\w+", passage.lower()))
+    if not q_words or not p_words:
+        return 0.0
+    inter = q_words & p_words
+    return float(len(inter)) / float(max(1, len(q_words)))
+
+
+def rerank_candidates_with_llm(
+    query: str, candidates: List[Dict], model: str = None, max_tokens: int = 512
+) -> List[float]:
+    """
+    Ask the LLM to score each candidate for relevance to the query.
+    - candidates: list of {"id": <int>, "text": <str>, "metadata": {...}, "score": <float>}
+    - returns: list of floats (same order as candidates) between 0.0 and 1.0
+
+    This version uses a stricter system prompt with a short example and a robust
+    JSON-array extraction helper as a fallback to avoid brittle regex captures.
+    """
+    if not candidates:
+        return []
+
+    model = model or OPENAI_MODEL
+    # Build a compact prompt that enumerates candidates.
+    truncated_cands = []
+    for i, c in enumerate(candidates):
+        text = c.get("text", "")
+        if len(text) > 600:
+            text = text[:600] + " …"
+        truncated_cands.append((i, text))
+
+    system_prompt = (
+        "You are a strict relevance scorer. Given a user's query and a small list of candidate passages, "
+        "return ONLY a JSON array of numbers between 0.0 and 1.0 (inclusive) representing the relevance of each "
+        "candidate to the query. The array must have the same length and order as the candidates. "
+        "Use at most three decimal places. Do NOT add any commentary, explanation, or trailing text.\n\n"
+        "EXAMPLE:\n"
+        "QUERY: Where do apples grow?\n"
+        "CANDIDATES:\n"
+        "0. Apples are fruits. They grow on trees.\n"
+        "1. Trees grow on apples.\n\n"
+        "RESPONSE:\n"
+        "[1.000, 0.000]\n"
+    )
+
+    parts = [f"QUERY: {query}", "", "CANDIDATES:"]
+    for idx, text in truncated_cands:
+        parts.append(f"{idx}. {text}")
+    user_prompt = "\n".join(parts)
+
+    try:
+        client = make_openai_client()
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=max(40),
+            temperature=0.0,
+            n=1,
+            timeout=30,
+        )
+        raw = ""
+        try:
+            raw = resp.choices[0].message.content.strip()
+        except Exception:
+            raw = resp["choices"][0]["message"]["content"].strip()
+
+        # Debug log (truncated) for troubleshooting in development
+        print("DEBUG: reranker raw (truncated 800):", raw[:800])
+
+        # Extract first JSON array robustly
+        arr_text = extract_first_json_array(raw)
+        if not arr_text:
+            raise ValueError("Reranker did not return JSON array.")
+        scores = json.loads(arr_text)
+
+        # validate and normalize
+        out = []
+        for s in scores:
+            try:
+                f = float(s)
+            except Exception:
+                f = 0.0
+            f = max(0.0, min(1.0, f))
+            out.append(round(f, 6))
+
+        if len(out) != len(candidates):
+            raise ValueError("Reranker length mismatch.")
+        return out
+
+    except Exception as e:
+        # fallback: compute normalized cosine similarity between query and candidate embeddings (if available)
+        print("DEBUG: reranker LLM failed, falling back to cosine. Error:", e)
+        fallback = []
+        try:
+            q_emb = embed_texts([query])[0]
+        except Exception:
+            q_emb = None
+        for c in candidates:
+            emb = c.get("embedding")
+            if emb and q_emb:
+                try:
+                    fallback.append(cosine_similarity(q_emb, emb))
+                except Exception:
+                    fallback.append(float(c.get("score", 0.0)))
+            else:
+                fallback.append(float(c.get("score", 0.0)))
+        maxv = max(fallback) if fallback else 1.0
+        if maxv <= 0:
+            maxv = 1.0
+        normalized = [min(1.0, max(0.0, f / maxv)) for f in fallback]
+        return normalized
+
+
+
+def rerank_and_sort_candidates(
+    query: str, rows: List[Dict], top_k: int = 5, use_reranker: bool = True
+):
+    """
+    rows: list of dicts with keys {id, text, metadata, score} where 'score' is FAISS score or similar.
+    Returns top_k rows sorted by reranker score if use_reranker True, otherwise by score.
+    Adds 'rerank_score' (and 'combined_score') to each returned row when reranker used.
+    """
+    if not rows:
+        return []
+
+    candidates = rows[: top_k * 3]
+    if use_reranker:
+        rerank_scores = rerank_candidates_with_llm(query, candidates)
+        for c, s in zip(candidates, rerank_scores):
+            c['rerank_score'] = float(s)
+            # add lexical overlap and combined score
+            lex = lexical_overlap_score(query, c.get('text', ''))
+            c['lexical_overlap'] = round(float(lex), 6)
+            c['combined_score'] = float(0.7 * c['rerank_score'] + 0.3 * c['lexical_overlap'])
+        # sort by combined_score then original score
+        candidates.sort(key=lambda x: (x.get('combined_score', 0.0), x.get('score', 0.0)), reverse=True)
+    else:
+        candidates.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+
+    return candidates[:top_k]
+
+
+# -----------------------------
+# Example OpenAI endpoints (concise, explanatory comments)
+# -----------------------------
+
+def rerank_candidates(query: str, candidates: List[Dict]) -> List[Dict]:
+    """
+    Backwards-compatible wrapper expected by `rag_query`.
+    Tries to use the LLM-based reranker pipeline (rerank_and_sort_candidates). If
+    anything goes wrong, it falls back to a safe deterministic ordering by `score`.
+
+    Returns a list of candidate dicts (same shape as input) with an added
+    'rerank_score' key when available and sorted by relevance descending.
+    """
+    if not candidates:
+        return []
+    try:
+        # Use the existing reranker + sorting helper to produce a ranked list.
+        ranked = rerank_and_sort_candidates(query, candidates, top_k=len(candidates), use_reranker=True)
+        # Ensure each returned candidate has a numeric rerank_score
+        for c in ranked:
+            if 'rerank_score' not in c:
+                c['rerank_score'] = float(c.get('score', 0.0))
+        return ranked
+    except Exception as e:
+        # Defensive fallback: log and return by original FAISS score
+        app.logger.exception("rerank_candidates wrapper failed, falling back to score sort: %s", e)
+        out = sorted(candidates, key=lambda x: x.get('score', 0.0), reverse=True)
+        for c in out:
+            if 'rerank_score' not in c:
+                try:
+                    c['rerank_score'] = float(c.get('score', 0.0))
+                except Exception:
+                    c['rerank_score'] = 0.0
+        return out
 
 # -----------------------------
 # Example OpenAI endpoints (concise, explanatory comments)
@@ -758,83 +967,141 @@ def rag_search():
 
 @app.route('/rag-query', methods=['POST'])
 def rag_query():
-    if not request.is_json:
-        return jsonify({"error": "JSON body required"}), 400
-    payload = request.get_json()
-    query = (payload.get('query') or '').strip()
-    if not query:
-        return jsonify({"error": "'query' required"}), 400
-    top_k = max(1, min(int(payload.get('top_k', 3)), 10))
-    use_llm = bool(payload.get('use_llm', True))
+    """
+    Robust wrapper over your previous rag_query.
+    Always returns a valid Flask response and logs unexpected errors for debugging.
+    POST JSON:
+      {"query":"...", "top_k": 3, "use_llm": true/false, "use_reranker": true/false}
+    """
     try:
-        q_emb = embed_texts([query])[0]
-    except Exception as e:
-        return jsonify({"error": "Embedding error", "detail": str(e)}), 502
-    # Use FAISS to get candidate docs
-    try:
-        faiss_hits = search_faiss_by_vector(q_emb, top_k=top_k*2)  # fetch a few extra for metadata filtering
-    except Exception as e:
-        return jsonify({"error": "FAISS search error", "detail": str(e)}), 502
+        if not request.is_json:
+            return jsonify({"error": "JSON body required"}), 400
 
-    rows = []
-    conn = sqlite3.connect(RAG_DB)
-    cur = conn.cursor()
-    for db_row_id, score in faiss_hits:
-        try:
-            cur.execute("SELECT id, text, metadata FROM docs WHERE id = ?", (db_row_id,))
-            row = cur.fetchone()
-        except Exception:
-            row = None
-        if not row:
-            continue
-        _id, text, md_json = row
-        try:
-            md = json.loads(md_json) if md_json else {}
-        except Exception:
-            md = {"_raw_metadata": md_json}
-        rows.append({"id": _id, "text": text, "metadata": md, "score": float(score)})
-    conn.close()
+        payload = request.get_json()
+        query = (payload.get('query') or '').strip()
+        if not query:
+            return jsonify({"error": "'query' required"}), 400
 
-    # sort by FAISS score (already in that order) and apply MIN_SCORE
-    rows.sort(key=lambda x: x["score"], reverse=True)
-    top = [r for r in rows if r["score"] >= MIN_SCORE][:top_k]
-    result = {"query": query, "top_matches": top}
-    if not top:
-        result['answer'] = "I don't know (no relevant documents match)."
-        return jsonify(result), 200
-    if not use_llm:
-        return jsonify(result), 200
-    # assemble context for LLM
-    MAX_CONTEXT_CHARS = 4000
-    parts = []
-    total = 0
-    for t in top:
-        txt = t['text']
-        if total + len(txt) > MAX_CONTEXT_CHARS:
-            remain = MAX_CONTEXT_CHARS - total
-            if remain <= 0:
-                break
-            txt = txt[:remain]
-        parts.append(txt)
-        total += len(txt)
-    context = '\n\n---\n\n'.join(parts)
-    system_prompt = ("You are a helpful assistant. Use ONLY the provided context to answer. "
-                     "If the answer is not in the context, say you don't know. Be concise.")
-    user_prompt = f"CONTEXT:\n{context}\n\nQUESTION:\n{query}"
-    try:
-        client = make_openai_client()
-        ai_resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            max_tokens=300,
-            temperature=0.0,
-            timeout=30,
-        )
-        answer = ai_resp.choices[0].message.content.strip()
-        result['answer'] = answer
-        return jsonify(result), 200
+        top_k = max(1, min(int(payload.get('top_k', 3)), 10))
+        use_llm = bool(payload.get('use_llm', True))
+        use_reranker = bool(payload.get('use_reranker', False))
+
+        # 1) embed query
+        try:
+            q_emb = embed_texts([query])[0]
+        except Exception as e:
+            app.logger.exception("Embedding error in rag_query")
+            return jsonify({"error": "Embedding error", "detail": str(e)}), 502
+
+        # 2) FAISS search (get a few extra if we will filter / rerank)
+        try:
+            fetch_k = top_k * 2 if use_reranker else top_k
+            faiss_hits = search_faiss_by_vector(q_emb, top_k=fetch_k)
+        except Exception as e:
+            app.logger.exception("FAISS search error in rag_query")
+            return jsonify({"error": "FAISS search error", "detail": str(e)}), 502
+
+        # 3) fetch DB rows for hits and assemble candidate list
+        rows = []
+        conn = sqlite3.connect(RAG_DB)
+        cur = conn.cursor()
+        try:
+            for db_row_id, score in faiss_hits:
+                # skip any invalid id/score
+                if db_row_id is None:
+                    continue
+                try:
+                    cur.execute("SELECT id, text, metadata FROM docs WHERE id = ?", (db_row_id,))
+                    r = cur.fetchone()
+                except Exception:
+                    r = None
+                if not r:
+                    continue
+                _id, text, md_json = r
+                try:
+                    md = json.loads(md_json) if md_json else {}
+                except Exception:
+                    md = {"_raw_metadata": md_json}
+                rows.append({"id": _id, "text": text, "metadata": md, "score": float(score)})
+        finally:
+            conn.close()
+
+        # 4) sort + MIN_SCORE filter
+        rows.sort(key=lambda x: x["score"], reverse=True)
+        top = [r for r in rows if r["score"] >= MIN_SCORE][:top_k]
+
+        result = {"query": query, "top_matches": top}
+
+        # 5) If no matches — return early with explicit answer
+        if not top:
+            result['answer'] = "I don't know (no relevant documents match)."
+            return jsonify(result), 200
+
+        # 6) If reranker requested, run it (optional)
+        if use_reranker:
+            try:
+                # reranker should be implemented elsewhere; we assume rerank_candidates(query, top)
+                # returns list of dicts with 'id', 'text', 'metadata', 'score', 'rerank_score' sorted by rerank_score desc
+                reranked = rerank_candidates(query, top)  # <-- ensure you have this function defined
+                if isinstance(reranked, list) and reranked:
+                    # keep only top_k after rerank
+                    top = reranked[:top_k]
+                    result['top_matches'] = top
+            except NameError:
+                # if reranker not implemented, log and continue with original top
+                app.logger.warning("rerank_candidates not found; skipping rerank")
+            except Exception as e:
+                app.logger.exception("Reranker error")
+                # don't fail entire request for reranker issues -- surface a partial result
+                result['reranker_error'] = str(e)
+
+        # 7) If not using LLM, return top matches
+        if not use_llm:
+            return jsonify(result), 200
+
+        # 8) Build context and call LLM
+        MAX_CONTEXT_CHARS = 4000
+        parts = []
+        total = 0
+        for t in top:
+            txt = t['text']
+            if total + len(txt) > MAX_CONTEXT_CHARS:
+                remain = MAX_CONTEXT_CHARS - total
+                if remain <= 0:
+                    break
+                txt = txt[:remain]
+            parts.append(txt)
+            total += len(txt)
+        context = '\n\n---\n\n'.join(parts)
+
+        system_prompt = ("You are a helpful assistant. Use ONLY the provided context to answer. "
+                         "If the answer is not in the context, say you don't know. Be concise.")
+        user_prompt = f"CONTEXT:\n{context}\n\nQUESTION:\n{query}"
+
+        try:
+            client = make_openai_client()
+            ai_resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                max_tokens=300,
+                temperature=0.0,
+                timeout=30,
+            )
+            # robust extraction
+            try:
+                answer = ai_resp.choices[0].message.content.strip()
+            except Exception:
+                answer = (ai_resp.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            result['answer'] = answer or "I don't know."
+            return jsonify(result), 200
+        except Exception as e:
+            app.logger.exception("OpenAI LLM error in rag_query")
+            return jsonify({"error": "OpenAI API error", "detail": str(e)}), 502
+
     except Exception as e:
-        return jsonify({"error": "OpenAI API error", "detail": str(e)}), 502
+        # Catch-all to ensure we always return a JSON response
+        app.logger.exception("Unexpected error in rag_query")
+        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
 
 
 # -----------------------------
