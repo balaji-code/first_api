@@ -30,6 +30,7 @@ import hashlib
 # Third-party
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+import requests
 from openai import OpenAI
 import faiss
 import numpy as np
@@ -483,6 +484,98 @@ def lexical_overlap_score(query: str, passage: str) -> float:
     return float(len(inter)) / float(max(1, len(q_words)))
 
 
+# --- Entity in text helper ---
+def entity_in_text(entity: str, txt: str) -> bool:
+    """Return True if the entity (or its simple plural) appears as a whole word in txt.
+    Accepts a pipe-separated entity string (e.g. 'apple|apples|fruit|fruits').
+    """
+    if not entity or not txt:
+        return False
+    txt_l = txt.lower()
+    # allow multiple tokens separated by | in entity_hint
+    for token in str(entity).split('|'):
+        t = token.strip().lower()
+        if not t:
+            continue
+        # exact word match
+        if re.search(rf"\b{re.escape(t)}\b", txt_l):
+            return True
+        # plural heuristic: add 's' if not present
+        if not t.endswith('s') and re.search(rf"\b{re.escape(t)}s\b", txt_l):
+            return True
+    return False
+
+
+# --- Entity hint expansion helper ---
+def expand_entity_hint(entity_hint: str) -> str:
+    """
+    Expand a short entity hint returned by the rewrite step into a pipe-separated
+    list of tokens we will try to match in documents. This is a lightweight,
+    deterministic approach that covers common pluralization and a handful of
+    useful domain mappings (e.g. 'fruit' -> 'apple|apples|fruit|fruits').
+    Returns a string like 'apple|apples|fruit|fruits' suitable for passing into
+    entity_in_text.
+    """
+    if not entity_hint:
+        return ''
+    e = entity_hint.strip().lower()
+    # simple domain-specific expansions (small deterministic map)
+    mapping = {
+        'fruit': 'apple|apples|fruit|fruits',
+        'dog': 'dog|dogs|puppy|puppies',
+        'car': 'car|cars|vehicle|vehicles',
+        'computer': 'computer|computers|pc|pcs',
+    }
+    if e in mapping:
+        return mapping[e]
+    # otherwise, produce variants: original, singular/plural heuristic
+    parts = [e]
+    if not e.endswith('s'):
+        parts.append(e + 's')
+    else:
+        parts.append(e[:-1])
+    # where helpful, include the plain stem (remove common suffixes)
+    stem = re.sub(r'(ing|ed|es)$', '', e)
+    if stem and stem not in parts:
+        parts.append(stem)
+    # dedupe and join
+    seen = []
+    for p in parts:
+        p = p.strip()
+        if p and p not in seen:
+            seen.append(p)
+    return '|'.join(seen)
+
+
+# --- Simple inversion penalty heuristic ---
+def simple_inversion_penalty(query: str, passage: str) -> float:
+    """
+    Very small heuristic to penalize obvious subject-object inversions such as
+    "trees grow on apples" vs "apples grow on trees". Returns a multiplier
+    (0.0-1.0) to apply to a reranker score (1.0 means no penalty).
+    This is intentionally conservative and only catches very simple patterns.
+    """
+    try:
+        q_low = query.lower()
+        p_low = passage.lower()
+        # look for simple "X grow(s) on Y" pattern in passage
+        m_subj = re.search(r"(\b\w+\b)\s+grow(?:s)?", p_low)
+        m_obj = re.search(r"grow(?:s)?\s+on\s+(\b\w+\b)", p_low)
+        if not (m_subj and m_obj):
+            return 1.0
+        subj = m_subj.group(1)
+        obj = m_obj.group(1)
+        # If both subj and obj are mentioned in the query, this is a strong signal
+        # that roles matter (e.g. query mentions "apples" and "trees"). Penalize
+        # if the passage swaps those roles.
+        if subj in q_low and obj in q_low:
+            # stronger but not total penalty for inverted role
+            return 0.05
+    except Exception:
+        pass
+    return 1.0
+
+
 def rerank_candidates_with_llm(
     query: str, candidates: List[Dict], model: str = None, max_tokens: int = 512
 ) -> List[float]:
@@ -603,17 +696,43 @@ def rerank_and_sort_candidates(
     if not rows:
         return []
 
+    # keep a wider candidate set for reranking
     candidates = rows[: top_k * 3]
+
     if use_reranker:
+        # call the LLM reranker to score candidates
         rerank_scores = rerank_candidates_with_llm(query, candidates)
+
+        # compute lexical overlap + apply inversion penalty + combine scores
+        alpha = 0.65  # weight for reranker score (reduced to avoid over-trusting LLM reranker)
+        entity_bonus = 0.06  # smaller entity boost
         for c, s in zip(candidates, rerank_scores):
-            c['rerank_score'] = float(s)
-            # add lexical overlap and combined score
+            # base reranker score (0..1)
+            rscore = float(s)
+            # apply simple inversion penalty (cheap heuristic)
+            penalty = simple_inversion_penalty(query, c.get('text', ''))
+            rscore = rscore * penalty
+            c['rerank_score'] = round(float(rscore), 6)
+            # lexical overlap signal
             lex = lexical_overlap_score(query, c.get('text', ''))
             c['lexical_overlap'] = round(float(lex), 6)
-            c['combined_score'] = float(0.7 * c['rerank_score'] + 0.3 * c['lexical_overlap'])
-        # sort by combined_score then original score
-        candidates.sort(key=lambda x: (x.get('combined_score', 0.0), x.get('score', 0.0)), reverse=True)
+            ent = int(c.get('entity_match', 0))
+            # small conditional entity signal applied only when lexical overlap is meaningful
+            entity_signal = entity_bonus if (ent and lex >= 0.25) else 0.0
+            # include a small contribution from the original semantic (FAISS) score as a tie-breaker
+            orig_score = float(c.get('score', 0.0))
+            c['combined_score'] = float(
+                alpha * c['rerank_score']
+                + (1 - alpha) * c['lexical_overlap']
+                + entity_signal
+                + 0.15 * orig_score
+            )
+            # helpful debug logging when combined_score is high but lexical overlap is very low
+            if c['combined_score'] > 0.8 and c['lexical_overlap'] < 0.15:
+                app.logger.warning("High combined_score but low lexical overlap for candidate id=%s", c.get('id'))
+
+        # sort by combined_score, then lexical_overlap, then original FAISS score
+        candidates.sort(key=lambda x: (x.get('combined_score', 0.0), x.get('lexical_overlap', 0.0), x.get('score', 0.0)), reverse=True)
     else:
         candidates.sort(key=lambda x: x.get('score', 0.0), reverse=True)
 
@@ -985,6 +1104,20 @@ def rag_query():
         top_k = max(1, min(int(payload.get('top_k', 3)), 10))
         use_llm = bool(payload.get('use_llm', True))
         use_reranker = bool(payload.get('use_reranker', False))
+        use_rewrite = bool(payload.get("use_rewrite", False))
+        entity_hint = None
+        if use_rewrite:
+            try:
+                rew_resp = requests.post(
+                    "http://127.0.0.1:5050/rewrite-query",
+                    json={"query": query}, timeout=10
+                )
+                rew_resp_json = rew_resp.json() if rew_resp.ok else {}
+                if 'rewritten' in rew_resp_json:
+                    query = rew_resp_json['rewritten']
+                    entity_hint = rew_resp_json.get('entity')
+            except Exception as e:
+                app.logger.debug("Rewrite failed: %s", e)
 
         # 1) embed query
         try:
@@ -1037,6 +1170,25 @@ def rag_query():
             result['answer'] = "I don't know (no relevant documents match)."
             return jsonify(result), 200
 
+        # --- bias candidates by entity_hint (if available) ---
+        if entity_hint:
+            # expand the hint into multiple lexical forms and check both text + metadata
+            expanded = expand_entity_hint(entity_hint)
+            for r in top:
+                text_low = (r.get('text') or '').lower()
+                md = r.get('metadata') or {}
+                meta_vals = ' '.join([str(v).lower() for v in md.values() if v])
+                # support multiple forms in expanded (pipe-separated)
+                match = False
+                if expanded:
+                    match = entity_in_text(expanded, text_low) or entity_in_text(expanded, meta_vals)
+                else:
+                    match = entity_in_text(entity_hint, text_low) or entity_in_text(entity_hint, meta_vals)
+                r['entity_match'] = 1 if match else 0
+            # push entity matches to the front (but keep score ordering inside each group)
+            top.sort(key=lambda x: (x.get('entity_match', 0), x.get('score', 0.0)), reverse=True)
+            result['top_matches'] = top
+
         # 6) If reranker requested, run it (optional)
         if use_reranker:
             try:
@@ -1062,6 +1214,8 @@ def rag_query():
         # 8) Build context and call LLM
         MAX_CONTEXT_CHARS = 4000
         parts = []
+        if entity_hint:
+            parts.append(f"(Entity hint: {entity_hint}. Treat synonyms and paraphrases as acceptable.)")
         total = 0
         for t in top:
             txt = t['text']
@@ -1074,8 +1228,13 @@ def rag_query():
             total += len(txt)
         context = '\n\n---\n\n'.join(parts)
 
-        system_prompt = ("You are a helpful assistant. Use ONLY the provided context to answer. "
-                         "If the answer is not in the context, say you don't know. Be concise.")
+        system_prompt = (
+            "You are a concise assistant whose only job is to answer the user's question using ONLY the "
+            "provided CONTEXT. Use synonyms and paraphrases when appropriate. If the context contains "
+            "an explicit factual sentence that answers the question, reply with that answer (concise, 1-2 sentences). "
+            "If the context does not contain the answer, reply: \"I don't know.\" Do NOT invent extra facts. "
+            "If multiple context lines have the answer, combine briefly."
+        )
         user_prompt = f"CONTEXT:\n{context}\n\nQUESTION:\n{query}"
 
         try:
@@ -1087,13 +1246,29 @@ def rag_query():
                 temperature=0.0,
                 timeout=30,
             )
+
             # robust extraction
             try:
-                answer = ai_resp.choices[0].message.content.strip()
+                raw_text = ai_resp.choices[0].message.content.strip()
             except Exception:
-                answer = (ai_resp.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+                raw_text = (ai_resp.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+
+            # debug log raw LLM output (truncated)
+            app.logger.debug("DEBUG: rag_query raw LLM response: %s", raw_text[:2000])
+
+            answer = raw_text
+
+            # If model explicitly says it doesn't know or returns nothing, fallback to best match
+            if not answer or answer.lower().strip() in ("i don't know.", "i don't know", "unknown", "no idea", "can't answer"):
+                if top and len(top) > 0:
+                    fallback_text = top[0].get("text", "")
+                    answer = f"Best matching document excerpt: {fallback_text}"
+                else:
+                    answer = "I don't know."
+
             result['answer'] = answer or "I don't know."
             return jsonify(result), 200
+
         except Exception as e:
             app.logger.exception("OpenAI LLM error in rag_query")
             return jsonify({"error": "OpenAI API error", "detail": str(e)}), 502
@@ -1102,6 +1277,40 @@ def rag_query():
         # Catch-all to ensure we always return a JSON response
         app.logger.exception("Unexpected error in rag_query")
         return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+
+@app.route('/rewrite-query', methods=['POST'])
+def rewrite_query():
+    if not request.is_json:
+        return jsonify({"error":"JSON body required"}), 400
+    payload = request.get_json()
+    query = (payload.get("query") or "").strip()
+    if not query:
+        return jsonify({"error":"'query' required"}), 400
+
+    system_prompt = (
+        "You will REWRITE user queries into a short, explicit search query suitable for document retrieval. "
+        "If the user mentions a concrete entity (e.g., 'apple', 'Python'), normalize it (use singular/plural as appropriate). "
+        "If ambiguous, TRY to infer the most-likely entity. "
+        "Return ONLY a JSON object with two keys: "
+        "'rewritten' (string) and 'entity' (string or null). Examples:\n"
+        '{"rewritten":"Where do apples grow?","entity":"apples"}\n'
+        '{"rewritten":"How to train a dog to sit?","entity":"dog"}'
+    )
+    user_prompt = f"Original query:\n{query}\n\nRewrite and extract entity if possible."
+    try:
+        raw = call_chat_with_system(system_prompt, user_prompt, max_tokens=60, temperature=0.0)
+        # robust parse: try JSON first, then fallback to plain text
+        try:
+            parsed = json.loads(raw)
+            rewritten = parsed.get("rewritten", raw).strip()
+            entity = parsed.get("entity")
+        except Exception:
+            # fallback: take whole raw as rewritten, entity = None
+            rewritten = raw.strip().splitlines()[0].strip()
+            entity = None
+        return jsonify({"original": query, "rewritten": rewritten, "entity": entity}), 200
+    except Exception as e:
+        return jsonify({"error":"LLM error","detail":str(e)}), 502
 
 
 # -----------------------------
