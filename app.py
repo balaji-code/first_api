@@ -84,7 +84,47 @@ app.config["JSON_AS_ASCII"] = False  # ensures non-ascii (e.g., Telugu) is retur
 # -----------------------------
 _CACHE: Dict[str, tuple] = {}
 _CACHE_TTL = 60 * 60  # 1 hour
+# ----------------- Light-weight Context Compression -----------------
+import re
+from functools import lru_cache
 
+# Simple in-memory cache for compressed chunks (id -> summary)
+# For production you'd persist this (SQLite table / KV store).
+COMPRESS_CACHE = {}
+
+# Basic sentence tokenizer (keeps punctuation). Splits on .!? + whitespace.
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[\.\?\!])\s+')
+
+def simple_compress_text(text: str, max_sentences: int = 2) -> str:
+    """
+    Tiny deterministic compressor: returns up-to max_sentences sentences
+    from the start of `text`. Reason: simple, fast, and predictable for learning.
+    """
+    if not text:
+        return ""
+    parts = _SENTENCE_SPLIT_RE.split(text.strip())
+    # If text lacks punctuation, fall back to character truncation
+    if len(parts) == 1 and len(parts[0]) > 400:
+        return parts[0][:400].rstrip() + "..."
+    selected = parts[:max_sentences]
+    return " ".join(s.strip() for s in selected if s.strip())
+
+def get_compressed_chunk(chunk_id: int, text: str, max_sentences: int = 2) -> str:
+    """
+    Use COMPRESS_CACHE keyed by chunk id (int) to avoid recomputing.
+    If chunk_id is None or not int, fall back to compress without caching.
+    """
+    try:
+        key = int(chunk_id)
+    except Exception:
+        return simple_compress_text(text, max_sentences=max_sentences)
+
+    if key in COMPRESS_CACHE:
+        return COMPRESS_CACHE[key]
+
+    summary = simple_compress_text(text, max_sentences=max_sentences)
+    COMPRESS_CACHE[key] = summary
+    return summary
 
 def cache_get(key: str):
     entry = _CACHE.get(key)
@@ -1083,6 +1123,35 @@ def rag_search():
             break
     conn.close()
     # done — top_matches already sorted by FAISS score
+
+    # Optional: compress top match texts for display (safe, non-destructive)
+    compress_context = bool(payload.get("compress_context", False))
+    try:
+        compress_max_sentences = int(payload.get("compress_max_sentences", 1))
+    except Exception:
+        compress_max_sentences = 1
+
+    if compress_context:
+        # Prefer cached compressor helper if available, fall back to simple_compress_text
+        compressor = globals().get("get_compressed_chunk")
+        for m in top_matches:
+            orig_text = m.get("text", "")
+            try:
+                if callable(compressor):
+                    # get_compressed_chunk expects (chunk_id, text, max_sentences)
+                    summary = compressor(m.get("id"), orig_text, max_sentences=compress_max_sentences)
+                else:
+                    summary = simple_compress_text(orig_text, max_sentences=compress_max_sentences)
+            except Exception:
+                # Defensive fallback — keep original text when compression fails
+                summary = orig_text
+
+            # Add diagnostic metadata so callers can see compression effect
+            m["original_text_length"] = len(orig_text)
+            m["compressed_text_length"] = len(summary)
+            m["compression_ratio"] = round(len(summary) / (len(orig_text) + 1), 3)
+            m["text"] = summary
+
     return jsonify({"query": query, "top_matches": top_matches, "count_scored": count_scored}), 200
 
 
@@ -1255,20 +1324,33 @@ def rag_query():
     
         # 8) Build context and call LLM
         MAX_CONTEXT_CHARS = 4000
-        parts = []
-        if entity_hint:
-            parts.append(f"(Entity hint: {entity_hint}. Treat synonyms and paraphrases as acceptable.)")
+                # assemble context - join top texts (truncate to MAX_CONTEXT_CHARS)
+        # Prepare the retrieved context for LLM (compress if requested, obey character budget)
+        context_parts = []
         total = 0
+        compress = bool(payload.get("compress_context", False))
+        max_sentences = int(payload.get("compress_max_sentences", 2))
+
         for t in top:
-            txt = t['text']
+            txt = t["text"]
+            chunk_id = t.get("id")  # may be int or str
+
+            if compress:
+                # Optionally compress chunk (using cached summary if available)
+                txt = get_compressed_chunk(chunk_id, txt, max_sentences=max_sentences)
+
+            # Enforce the overall MAX_CONTEXT_CHARS limit
             if total + len(txt) > MAX_CONTEXT_CHARS:
                 remain = MAX_CONTEXT_CHARS - total
                 if remain <= 0:
-                    break
-                txt = txt[:remain]
-            parts.append(txt)
+                    break  # Context budget exhausted
+                txt = txt[:remain]  # Truncate text to fit remaining space
+
+            context_parts.append(txt)
             total += len(txt)
-        context = '\n\n---\n\n'.join(parts)
+
+        # Join context chunks with a separator for clarity
+        context = "\n\n---\n\n".join(context_parts)
 
         system_prompt = (
             "You are a concise assistant whose only job is to answer the user's question using ONLY the "
@@ -1381,8 +1463,54 @@ def rewrite_query():
         return jsonify({"original": query, "rewritten": rewritten, "entity": entity}), 200
     except Exception as e:
         return jsonify({"error":"LLM error","detail":str(e)}), 502
+        
+@app.route("/compress", methods=["POST"])
+def compress_endpoint():
+    """
+    Endpoint for fast, deterministic text compression.
 
+    POST JSON:
+      { "text": "...", "max_sentences": 2 }
+    Returns:
+      { "summary": "..." }
 
+    - 'text' (str, required): Text to compress.
+    - 'max_sentences' (int, optional): Max number of sentences to keep (default: 2).
+
+    Used for RAG context compression.
+    """
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+
+    payload = request.get_json()
+    text = payload.get("text", "")
+    if not text:
+        return jsonify({"error": "'text' required"}), 400
+
+    try:
+        ms = int(payload.get("max_sentences", 2))
+    except Exception:
+        ms = 2  # Fallback default if conversion fails
+
+    # Compress the text using simple_compress_text utility
+    summary = simple_compress_text(text, max_sentences=ms)
+    return jsonify({"summary": summary}), 200
+    
+@app.route("/compress-cache-clear", methods=["POST"])
+def compress_cache_clear():
+    """
+    Endpoint to clear the in-memory compression summary cache (COMPRESS_CACHE).
+    This helps reset state if summaries have changed or for testing purposes.
+
+    Returns:
+        JSON with status, cleared flag, and current cache_size (should be 0).
+    """
+    COMPRESS_CACHE.clear()
+    return jsonify({
+        "status": "ok",
+        "cleared": True,
+        "cache_size": len(COMPRESS_CACHE)
+    }), 200
 # -----------------------------
 # Run the server
 # -----------------------------
