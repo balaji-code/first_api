@@ -57,6 +57,8 @@ try:
     MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.12"))
 except Exception:
     MIN_SCORE = 0.12
+# RAG_CONFIDENCE_THRESHOLD: minimum conservative score (0..1) required to let the LLM answer; lower values make the system more permissive
+RAG_CONFIDENCE_THRESHOLD = float(os.getenv("RAG_CONFIDENCE_THRESHOLD", "0.6"))
 
 print("DEBUG: RAG_DB=", RAG_DB)
 print("DEBUG: OPENAI_MODEL=", OPENAI_MODEL)
@@ -1098,6 +1100,7 @@ def rag_query():
 
         payload = request.get_json()
         query = (payload.get('query') or '').strip()
+        original_query = query  # keep original for output when rewrite is used
         if not query:
             return jsonify({"error": "'query' required"}), 400
 
@@ -1118,6 +1121,8 @@ def rag_query():
                     entity_hint = rew_resp_json.get('entity')
             except Exception as e:
                 app.logger.debug("Rewrite failed: %s", e)
+        # preserve original for client visibility
+        original_query_saved = original_query
 
         # 1) embed query
         try:
@@ -1163,7 +1168,7 @@ def rag_query():
         rows.sort(key=lambda x: x["score"], reverse=True)
         top = [r for r in rows if r["score"] >= MIN_SCORE][:top_k]
 
-        result = {"query": query, "top_matches": top}
+        result = {"query": query, "top_matches": top, "original_query": original_query_saved if 'original_query_saved' in locals() else None}
 
         # 5) If no matches — return early with explicit answer
         if not top:
@@ -1210,7 +1215,44 @@ def rag_query():
         # 7) If not using LLM, return top matches
         if not use_llm:
             return jsonify(result), 200
+        def chunk_supports_answer(query, chunk_text):
+            q = query.lower()
+            c = chunk_text.lower()
 
+            # Token overlap requirement (cheap lexical signal)
+            q_words = set(re.findall(r"\w+", q))
+            c_words = set(re.findall(r"\w+", c))
+            overlap = q_words & c_words
+            if len(overlap) == 0:
+                return False
+            # require at least some meaningful overlap (at least 20% of query tokens)
+            if len(overlap) / max(1, len(q_words)) < 0.20:
+                return False
+
+            # Simple inversion detection: if the chunk swaps subject/object roles, consider it unsupported
+            if simple_inversion_penalty(query, chunk_text) < 0.2:
+                return False
+
+            # Optional embedding similarity check (weak) to guard against coincidental lexical overlap
+            try:
+                q_emb = embed_texts([query])[0]
+                c_emb = embed_texts([chunk_text])[0]
+                sim = cosine_similarity(q_emb, c_emb)
+                # require at least a modest semantic alignment
+                if sim < 0.20:
+                    return False
+            except Exception:
+                # if embeddings fail, continue with lexical signals only
+                pass
+
+            # block explicit negations in candidate (e.g., 'not', 'never') that contradict a positive-looking query
+            neg_words = (" not ", " never ", " no ")
+            if any(n in c for n in neg_words) and any(w in q for w in ("where", "how", "what", "who", "when", "which", "do", "does", "are", "is")):
+                # conservative: if chunk contains negation and the query is asking positively, reject
+                return False
+
+            return True
+    
         # 8) Build context and call LLM
         MAX_CONTEXT_CHARS = 4000
         parts = []
@@ -1252,7 +1294,35 @@ def rag_query():
                 raw_text = ai_resp.choices[0].message.content.strip()
             except Exception:
                 raw_text = (ai_resp.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            supported_chunks = [t for t in top if chunk_supports_answer(query, t["text"])]
 
+            # compute a conservative confidence estimate and gate answers below threshold
+            try:
+                support_ratio = float(len(supported_chunks)) / float(max(1, len(top)))
+                top_score = float(top[0].get('score', 0.0)) if top else 0.0
+                # confidence mixes evidence density (support_ratio) and strongest semantic score
+                confidence = 0.5 * support_ratio + 0.5 * min(1.0, top_score)
+            except Exception:
+                confidence = 0.0
+
+            if confidence < RAG_CONFIDENCE_THRESHOLD:
+                # do not answer when confidence is low — be explicit and return retrieved matches for inspection
+                return jsonify({
+                    "query": query,
+                    "original_query": original_query_saved if 'original_query_saved' in locals() else None,
+                    "answer": "I don't know.",
+                    "confidence": round(float(confidence), 3),
+                    "reason": "Low confidence from retrieved evidence",
+                    "top_matches": top
+                }), 200
+
+            if not supported_chunks:
+                return jsonify({
+                    "query": query,
+                    "answer": "I don't know.",
+                    "reason": "No retrieved chunk explicitly supports an answer.",
+                    "top_matches": top
+                }), 200
             # debug log raw LLM output (truncated)
             app.logger.debug("DEBUG: rag_query raw LLM response: %s", raw_text[:2000])
 
