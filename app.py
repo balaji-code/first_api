@@ -439,6 +439,7 @@ def search_faiss_by_vector(query_emb: List[float], top_k: int = 5):
         out.append((db_id, float(score)))
     return out
 # Make sure DB exists when module is imported/run
+
 ensure_db()
 init_faiss_index()
 # -----------------------------
@@ -592,29 +593,41 @@ def expand_entity_hint(entity_hint: str) -> str:
 # --- Simple inversion penalty heuristic ---
 def simple_inversion_penalty(query: str, passage: str) -> float:
     """
-    Very small heuristic to penalize obvious subject-object inversions such as
+    Conservative heuristic to penalize simple subject-object inversions such as
     "trees grow on apples" vs "apples grow on trees". Returns a multiplier
     (0.0-1.0) to apply to a reranker score (1.0 means no penalty).
-    This is intentionally conservative and only catches very simple patterns.
+
+    Improvements vs previous version:
+    - Less aggressive default penalty (0.2 instead of 0.05) to avoid throwing
+      away potentially useful passages entirely.
+    - Better detection of 'grow' forms and safer checks for presence of tokens
+      in the query (tokenized) so we don't penalize unless both tokens appear
+      in the query and appear to have swapped roles.
+    - If detection fails for any reason, returns 1.0 (no penalty).
     """
     try:
+        if not query or not passage:
+            return 1.0
         q_low = query.lower()
         p_low = passage.lower()
         # look for simple "X grow(s) on Y" pattern in passage
-        m_subj = re.search(r"(\b\w+\b)\s+grow(?:s)?", p_low)
-        m_obj = re.search(r"grow(?:s)?\s+on\s+(\b\w+\b)", p_low)
+        m_subj = re.search(r"\b([a-z0-9_'-]{1,40})\b\s+grow(?:s|ing)?\b", p_low)
+        m_obj = re.search(r"grow(?:s|ing)?\b\s+on\s+\b([a-z0-9_'-]{1,40})\b", p_low)
         if not (m_subj and m_obj):
             return 1.0
         subj = m_subj.group(1)
         obj = m_obj.group(1)
-        # If both subj and obj are mentioned in the query, this is a strong signal
-        # that roles matter (e.g. query mentions "apples" and "trees"). Penalize
-        # if the passage swaps those roles.
-        if subj in q_low and obj in q_low:
-            # stronger but not total penalty for inverted role
-            return 0.05
+        # Tokenize query words for safer membership checks
+        q_tokens = set(re.findall(r"\w+", q_low))
+        # only apply penalty when both subj and obj appear in the query (role-sensitive)
+        if subj in q_tokens and obj in q_tokens:
+            # If passage swaps roles compared to natural query order, apply moderate penalty
+            # (0.2) but do not zero-out the score. This avoids discarding candidates that
+            # may still contain useful context.
+            return 0.2
     except Exception:
-        pass
+        # On error, do not penalize
+        return 1.0
     return 1.0
 
 
@@ -779,7 +792,100 @@ def rerank_and_sort_candidates(
         candidates.sort(key=lambda x: x.get('score', 0.0), reverse=True)
 
     return candidates[:top_k]
+# -----------------------------
+# Evidence scoring helper
+# -----------------------------
 
+# Get minimum required evidence score from environment variable, default to 0.0 if not set or invalid.
+try:
+    EVIDENCE_MIN = float(os.getenv("RAG_EVIDENCE_MIN", "0.0"))
+except Exception:
+    EVIDENCE_MIN = 0.0
+
+def compute_evidence_score(
+    query: str,
+    candidate: dict,
+    q_emb: list | None = None,
+    weights: dict | None = None
+) -> dict:
+    """
+    Compute evidence components and a combined evidence score for a candidate.
+
+    Returns:
+        dict: {S, L, M, C, evidence_score}
+            S: semantic similarity (float 0..1)
+            L: lexical overlap (float 0..1)
+            M: entity match (1 or 0)
+            C: contradiction/inversion penalty flag (1 or 0)
+            evidence_score: weighted combination (float)
+
+    Args:
+        query (str): original (or rewritten) query
+        candidate (dict): has keys 'text', 'metadata', 'embedding', 'score'
+        q_emb (list or None): precomputed query embedding (recommended)
+        weights (dict or None): keys alpha, beta, gamma, delta
+
+    Note: Keep this deterministic and conservative during learning.
+    """
+
+    # Set default weights if not provided
+    if weights is None:
+        weights = {"alpha": 0.55, "beta": 0.25, "gamma": 0.10, "delta": 0.80}
+
+    text = (candidate.get("text") or "").strip()
+    md = candidate.get("metadata") or {}
+
+    # 1. Semantic similarity S (range 0..1)
+    S = 0.0
+    try:
+        if q_emb is None:
+            # Compute embedding for the query if not provided
+            q_emb = embed_texts([query])[0]
+        c_emb = candidate.get("embedding")
+        if c_emb:
+            S = float(cosine_similarity(q_emb, c_emb))
+        else:
+            # Fallback: use FAISS score as proxy, clamp to [0,1]
+            S = max(0.0, min(1.0, float(candidate.get("score", 0.0))))
+    except Exception:
+        # If embedding fails, fallback to FAISS score
+        S = max(0.0, min(1.0, float(candidate.get("score", 0.0))))
+
+    # 2. Lexical overlap L (fraction of query tokens covered, 0..1)
+    q_words = set(re.findall(r"\w+", query.lower()))
+    t_words = set(re.findall(r"\w+", text.lower()))
+    L = float(len(q_words & t_words)) / max(1, len(q_words))
+
+    # 3. Entity match M (1 if candidate matched query entity, 0 otherwise)
+    M = 1.0 if int(candidate.get("entity_match", 0)) else 0.0
+
+    # 4. Contradiction/inversion penalty flag C_flag (1 = problematic, else 0)
+    C_flag = 0
+    try:
+        penalty = simple_inversion_penalty(query, text)
+        # If inversion penalty is very low, mark as contradiction
+        if penalty < 0.2:
+            C_flag = 1
+    except Exception:
+        # On error, do not penalize
+        C_flag = 0
+
+    # 5. Compute weighted sum for combined evidence_score
+    alpha = weights["alpha"]
+    beta = weights["beta"]
+    gamma = weights["gamma"]
+    delta = weights["delta"]
+
+    evidence_score = alpha * S + beta * L + gamma * M - delta * float(C_flag)
+
+    # 6. Clamp component values for numeric stability and return as rounded values
+    return {
+        "S": round(float(S), 6),
+        "L": round(float(L), 6),
+        "M": int(M),
+        "C": int(C_flag),
+        "evidence_score": round(float(evidence_score), 6),
+    }
 
 # -----------------------------
 # Example OpenAI endpoints (concise, explanatory comments)
@@ -1178,6 +1284,7 @@ def rag_query():
         use_reranker = bool(payload.get('use_reranker', False))
         use_rewrite = bool(payload.get("use_rewrite", False))
         entity_hint = None
+
         if use_rewrite:
             try:
                 rew_resp = requests.post(
@@ -1190,6 +1297,7 @@ def rag_query():
                     entity_hint = rew_resp_json.get('entity')
             except Exception as e:
                 app.logger.debug("Rewrite failed: %s", e)
+
         # preserve original for client visibility
         original_query_saved = original_query
 
@@ -1218,18 +1326,34 @@ def rag_query():
                 if db_row_id is None:
                     continue
                 try:
-                    cur.execute("SELECT id, text, metadata FROM docs WHERE id = ?", (db_row_id,))
+                    # fetch id, text, embedding, metadata
+                    cur.execute(
+                        "SELECT id, text, embedding, metadata FROM docs WHERE id = ?", (db_row_id,)
+                    )
                     r = cur.fetchone()
-                except Exception:
-                    r = None
-                if not r:
-                    continue
-                _id, text, md_json = r
-                try:
-                    md = json.loads(md_json) if md_json else {}
-                except Exception:
-                    md = {"_raw_metadata": md_json}
-                rows.append({"id": _id, "text": text, "metadata": md, "score": float(score)})
+                    if not r:
+                        continue
+                    _id, text, emb_json, md_json = r
+                    # parse embedding JSON if present
+                    try:
+                        emb = json.loads(emb_json) if emb_json else None
+                    except Exception:
+                        emb = None
+                    try:
+                        md = json.loads(md_json) if md_json else {}
+                    except Exception:
+                        md = {"_raw_metadata": md_json}
+                    rows.append(
+                        {
+                            "id": _id,
+                            "text": text,
+                            "metadata": md,
+                            "score": float(score),
+                            "embedding": emb,
+                        }
+                    )
+                except Exception as e:
+                    app.logger.exception("Error fetching row from DB: %s", e)
         finally:
             conn.close()
 
@@ -1237,7 +1361,40 @@ def rag_query():
         rows.sort(key=lambda x: x["score"], reverse=True)
         top = [r for r in rows if r["score"] >= MIN_SCORE][:top_k]
 
-        result = {"query": query, "top_matches": top, "original_query": original_query_saved if 'original_query_saved' in locals() else None}
+        # Build the result object. Allow optional SUMMARY-compression of displayed top matches
+        result = {
+            "query": query,
+            "top_matches": top,
+            "original_query": original_query_saved
+        }
+
+        # Optional: compress top match texts for display (safe, non-destructive)
+        compress_context = bool(payload.get("compress_context", False))
+        try:
+            compress_max_sentences = int(payload.get("compress_max_sentences", 1))
+        except Exception:
+            compress_max_sentences = 1
+
+        if compress_context:
+            # Prefer cached compressor helper if available, fall back to simple_compress_text
+            compressor = globals().get("get_compressed_chunk")
+            for m in result["top_matches"]:
+                orig_text = m.get("text", "")
+                try:
+                    if callable(compressor):
+                        # get_compressed_chunk expects (chunk_id, text, max_sentences)
+                        summary = compressor(m.get("id"), orig_text, max_sentences=compress_max_sentences)
+                    else:
+                        summary = simple_compress_text(orig_text, max_sentences=compress_max_sentences)
+                except Exception:
+                    # Defensive fallback — keep original text when compression fails
+                    summary = orig_text
+
+                # Add diagnostic metadata so callers can see compression effect
+                m["original_text_length"] = len(orig_text)
+                m["compressed_text_length"] = len(summary)
+                m["compression_ratio"] = round(len(summary) / (len(orig_text) + 1), 3)
+                m["text"] = summary
 
         # 5) If no matches — return early with explicit answer
         if not top:
@@ -1281,9 +1438,39 @@ def rag_query():
                 # don't fail entire request for reranker issues -- surface a partial result
                 result['reranker_error'] = str(e)
 
+        # --- evidence scoring: compute query embedding once, score candidates, filter/sort ---
+        try:
+            q_emb_for_evidence = embed_texts([query])[0]
+        except Exception:
+            q_emb_for_evidence = None
+
+        # compute evidence for each candidate in 'top' (or in rows if you prefer wider baseline)
+        for r in top:
+            try:
+                ev = compute_evidence_score(query, r, q_emb=q_emb_for_evidence)
+            except Exception as e:
+                ev = {"S": 0.0, "L": 0.0, "M": 0, "C": 0, "evidence_score": 0.0}
+            r['evidence'] = ev
+            r['evidence_score'] = ev['evidence_score']
+
+        # remove candidates flagged as contradictory (C==1)
+        filtered = [r for r in top if r.get('evidence', {}).get('C', 0) == 0]
+
+        # apply minimum evidence threshold (env var EVIDENCE_MIN)
+        filtered = [r for r in filtered if r.get('evidence_score', -999) >= EVIDENCE_MIN]
+
+        # final sort by evidence_score then original score as tie-breaker
+        filtered.sort(key=lambda x: (x.get('evidence_score', 0.0), x.get('score', 0.0)), reverse=True)
+
+        # keep top_k
+        top = filtered[:top_k]
+        # update result
+        result['top_matches'] = top
+
         # 7) If not using LLM, return top matches
         if not use_llm:
             return jsonify(result), 200
+
         def chunk_supports_answer(query, chunk_text):
             q = query.lower()
             c = chunk_text.lower()
@@ -1314,22 +1501,25 @@ def rag_query():
                 # if embeddings fail, continue with lexical signals only
                 pass
 
-            # block explicit negations in candidate (e.g., 'not', 'never') that contradict a positive-looking query
+            # block explicit negations in candidate (e.g., 'not', 'never', ' no ') that contradict a positive-looking query
             neg_words = (" not ", " never ", " no ")
             if any(n in c for n in neg_words) and any(w in q for w in ("where", "how", "what", "who", "when", "which", "do", "does", "are", "is")):
                 # conservative: if chunk contains negation and the query is asking positively, reject
                 return False
 
             return True
-    
+
         # 8) Build context and call LLM
         MAX_CONTEXT_CHARS = 4000
-                # assemble context - join top texts (truncate to MAX_CONTEXT_CHARS)
+        # assemble context - join top texts (truncate to MAX_CONTEXT_CHARS)
         # Prepare the retrieved context for LLM (compress if requested, obey character budget)
         context_parts = []
         total = 0
         compress = bool(payload.get("compress_context", False))
-        max_sentences = int(payload.get("compress_max_sentences", 2))
+        try:
+            max_sentences = int(payload.get("compress_max_sentences", 2))
+        except Exception:
+            max_sentences = 2
 
         for t in top:
             txt = t["text"]
@@ -1337,7 +1527,11 @@ def rag_query():
 
             if compress:
                 # Optionally compress chunk (using cached summary if available)
-                txt = get_compressed_chunk(chunk_id, txt, max_sentences=max_sentences)
+                try:
+                    txt = get_compressed_chunk(chunk_id, txt, max_sentences=max_sentences)
+                except Exception:
+                    # fallback: use original text on compression error
+                    pass
 
             # Enforce the overall MAX_CONTEXT_CHARS limit
             if total + len(txt) > MAX_CONTEXT_CHARS:
@@ -1375,7 +1569,12 @@ def rag_query():
             try:
                 raw_text = ai_resp.choices[0].message.content.strip()
             except Exception:
-                raw_text = (ai_resp.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+                try:
+                    # fallback to dict style
+                    raw_text = (ai_resp.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+                except Exception:
+                    raw_text = ""
+
             supported_chunks = [t for t in top if chunk_supports_answer(query, t["text"])]
 
             # compute a conservative confidence estimate and gate answers below threshold
@@ -1391,7 +1590,7 @@ def rag_query():
                 # do not answer when confidence is low — be explicit and return retrieved matches for inspection
                 return jsonify({
                     "query": query,
-                    "original_query": original_query_saved if 'original_query_saved' in locals() else None,
+                    "original_query": original_query_saved,
                     "answer": "I don't know.",
                     "confidence": round(float(confidence), 3),
                     "reason": "Low confidence from retrieved evidence",
@@ -1511,7 +1710,58 @@ def compress_cache_clear():
         "cleared": True,
         "cache_size": len(COMPRESS_CACHE)
     }), 200
-# -----------------------------
+    
+@app.route('/rag-debug', methods=['POST'])
+def rag_debug():
+    """
+    Debug endpoint: run the retrieval pipeline but return full candidates and computed evidence
+    without aggressive filtering. POST JSON: {"query":"...", "fetch_k": 10}
+    """
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+    payload = request.get_json()
+    query = (payload.get('query') or '').strip()
+    if not query:
+        return jsonify({"error": "'query' required"}), 400
+    try:
+        fetch_k = int(payload.get('fetch_k', 10))
+    except Exception:
+        fetch_k = 10
+    try:
+        q_emb = embed_texts([query])[0]
+    except Exception as e:
+        q_emb = None
+    faiss_hits = search_faiss_by_vector(q_emb, top_k=fetch_k) if q_emb is not None else []
+    conn = sqlite3.connect(RAG_DB)
+    cur = conn.cursor()
+    rows = []
+    try:
+        for db_row_id, score in faiss_hits:
+            try:
+                cur.execute("SELECT id, text, embedding, metadata FROM docs WHERE id = ?", (db_row_id,))
+                r = cur.fetchone()
+                if not r:
+                    continue
+                _id, text, emb_json, md_json = r
+                try:
+                    emb = json.loads(emb_json) if emb_json else None
+                except Exception:
+                    emb = None
+                try:
+                    md = json.loads(md_json) if md_json else {}
+                except Exception:
+                    md = {"_raw_metadata": md_json}
+                cand = {"id": _id, "text": text, "metadata": md, "score": float(score), "embedding": emb}
+                try:
+                    cand['evidence'] = compute_evidence_score(query, cand, q_emb=q_emb)
+                except Exception:
+                    cand['evidence'] = {"S": 0.0, "L": 0.0, "M": 0, "C": 0, "evidence_score": 0.0}
+                rows.append(cand)
+            except Exception:
+                continue
+    finally:
+        conn.close()
+    return jsonify({"query": query, "candidates": rows}), 200
 # Run the server
 # -----------------------------
 if __name__ == '__main__':
