@@ -7,3 +7,5 @@ __pycache__/
 vector_store.db
 faiss_idmap.pickle
 vector_store.faiss
+seed_docs.json
+*.db.bak
