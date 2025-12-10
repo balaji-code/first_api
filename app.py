@@ -593,42 +593,61 @@ def expand_entity_hint(entity_hint: str) -> str:
 # --- Simple inversion penalty heuristic ---
 def simple_inversion_penalty(query: str, passage: str) -> float:
     """
-    Conservative heuristic to penalize simple subject-object inversions such as
-    "trees grow on apples" vs "apples grow on trees". Returns a multiplier
-    (0.0-1.0) to apply to a reranker score (1.0 means no penalty).
+    Conservatively detect simple subject-object inversions around the verb 'grow'
+    and apply a heavy penalty (0.05) so inverted passages are downweighted.
 
-    Improvements vs previous version:
-    - Less aggressive default penalty (0.2 instead of 0.05) to avoid throwing
-      away potentially useful passages entirely.
-    - Better detection of 'grow' forms and safer checks for presence of tokens
-      in the query (tokenized) so we don't penalize unless both tokens appear
-      in the query and appear to have swapped roles.
-    - If detection fails for any reason, returns 1.0 (no penalty).
+    Improvements made in this replacement:
+    - Added detection of explicit contrast words (e.g., "not", "instead") to slightly
+      relax the penalty when the passage explicitly negates or contrasts a claim (returns 0.2)
+      — this helps avoid false positives on sentences like "They grow on plants, not trees." which
+      are contrastive rather than inverted facts.
+    - Keep strong penalty (0.05) when a real inversion is detected.
+    - Be permissive (1.0) when we cannot parse a clear subj/obj or when inputs are empty.
     """
     try:
         if not query or not passage:
             return 1.0
         q_low = query.lower()
         p_low = passage.lower()
-        # look for simple "X grow(s) on Y" pattern in passage
+
+        # look for simple subject / object patterns around 'grow'
         m_subj = re.search(r"\b([a-z0-9_'-]{1,40})\b\s+grow(?:s|ing)?\b", p_low)
         m_obj = re.search(r"grow(?:s|ing)?\b\s+on\s+\b([a-z0-9_'-]{1,40})\b", p_low)
+
         if not (m_subj and m_obj):
             return 1.0
+
         subj = m_subj.group(1)
         obj = m_obj.group(1)
-        # Tokenize query words for safer membership checks
+
+        # Tokenize query safely
         q_tokens = set(re.findall(r"\w+", q_low))
-        # only apply penalty when both subj and obj appear in the query (role-sensitive)
-        if subj in q_tokens and obj in q_tokens:
-            # If passage swaps roles compared to natural query order, apply moderate penalty
-            # (0.2) but do not zero-out the score. This avoids discarding candidates that
-            # may still contain useful context.
-            return 0.2
-    except Exception:
-        # On error, do not penalize
+        subj_in_q = subj in q_tokens
+        obj_in_q = obj in q_tokens
+
+        # If neither appears in the query, be permissive
+        if not subj_in_q and not obj_in_q:
+            return 1.0
+
+        # Check for explicit contrast words in the passage which often indicate a correction
+        contrast_words = (" not ", " instead ", " rather ", " but ")
+        has_contrast = any(w in p_low for w in contrast_words)
+
+        # If only the object appears and it is likely a role-swap (inversion) -> heavy penalty
+        if obj_in_q and not subj_in_q:
+            # slightly relax penalty if passage explicitly contrasts (e.g. "not trees")
+            return 0.2 if has_contrast else 0.05
+
+        # If both appear in the query, this is an ambivalent/leading question.
+        # Apply strong penalty but relax slightly when passage contains explicit contrast words.
+        if subj_in_q and obj_in_q:
+            return 0.2 if has_contrast else 0.05
+
+        # Other cases (only subj in query) -> no penalty
         return 1.0
-    return 1.0
+
+    except Exception:
+        return 1.0
 
 
 def rerank_candidates_with_llm(
@@ -866,6 +885,19 @@ def compute_evidence_score(
         # If inversion penalty is very low, mark as contradiction
         if penalty < 0.2:
             C_flag = 1
+        # Add structured debug logging so we can trace why candidates are penalized.
+        try:
+            cid = candidate.get('id') if isinstance(candidate, dict) else None
+            app.logger.debug(
+                "compute_evidence_score: candidate_id=%s penalty=%s C=%s query_preview=%s passage_preview=%s",
+                str(cid),
+                str(round(penalty, 4)),
+                str(C_flag),
+                (query[:120] + '...') if len(query) > 120 else query,
+                (text[:120] + '...') if len(text) > 120 else text,
+            )
+        except Exception:
+            pass
     except Exception:
         # On error, do not penalize
         C_flag = 0
@@ -1183,52 +1215,76 @@ def rag_search():
         return jsonify({"error": "'query' required"}), 400
     top_k = max(1, min(int(payload.get('top_k', 3)), 20))
     metadata_filter = payload.get('metadata', {}) or {}
+
+    # 1) compute query embedding (used for evidence S and optional semantic checks)
     try:
         q_emb = embed_texts([query])[0]
     except Exception as e:
         return jsonify({"error": "Embedding error", "detail": str(e)}), 502
-    # 2. Use FAISS to get the top candidate DB row ids + scores
+
+    # 2) Use FAISS to get candidate DB row ids + scores
     try:
-        faiss_hits = search_faiss_by_vector(q_emb, top_k=top_k)
+        faiss_hits = search_faiss_by_vector(q_emb, top_k=top_k * 3)  # fetch extra to allow filtering
     except Exception as e:
         return jsonify({"error": "FAISS search error", "detail": str(e)}), 502
 
-    top_matches = []
     conn = sqlite3.connect(RAG_DB)
     cur = conn.cursor()
+    candidates = []
     count_scored = 0
-    for db_row_id, score in faiss_hits:
-        count_scored += 1
-        # metadata filter
-        try:
-            cur.execute("SELECT id, text, metadata FROM docs WHERE id = ?", (db_row_id,))
-            row = cur.fetchone()
-        except Exception:
-            row = None
-        if not row:
-            continue
-        _id, text, md_json = row
-        try:
-            md = json.loads(md_json) if md_json else {}
-        except Exception:
-            md = {"_raw_metadata": md_json}
-        # apply metadata filter
-        ok = True
-        if isinstance(metadata_filter, dict):
-            for k, v in metadata_filter.items():
-                if md.get(k) != v:
-                    ok = False
-                    break
-        if not ok:
-            continue
-        # enforce MIN_SCORE threshold
-        if score < MIN_SCORE:
-            continue
-        top_matches.append({"id": _id, "text": text, "metadata": md, "score": float(score)})
-        if len(top_matches) >= top_k:
-            break
-    conn.close()
-    # done — top_matches already sorted by FAISS score
+    try:
+        for db_row_id, score in faiss_hits:
+            count_scored += 1
+            try:
+                cur.execute("SELECT id, text, metadata FROM docs WHERE id = ?", (db_row_id,))
+                row = cur.fetchone()
+            except Exception:
+                row = None
+            if not row:
+                continue
+            _id, text, md_json = row
+            try:
+                md = json.loads(md_json) if md_json else {}
+            except Exception:
+                md = {"_raw_metadata": md_json}
+
+            # apply metadata filter
+            ok = True
+            if isinstance(metadata_filter, dict):
+                for k, v in metadata_filter.items():
+                    if md.get(k) != v:
+                        ok = False
+                        break
+            if not ok:
+                continue
+
+            # enforce MIN_SCORE threshold (faiss score)
+            if score < MIN_SCORE:
+                continue
+
+            cand = {"id": _id, "text": text, "metadata": md, "score": float(score)}
+            # compute evidence for this candidate (S,L,M,C,evidence_score)
+            try:
+                ev = compute_evidence_score(query, {**cand, "embedding": None}, q_emb=q_emb)
+            except Exception:
+                ev = {"S": 0.0, "L": 0.0, "M": 0, "C": 0, "evidence_score": 0.0}
+            cand["evidence"] = ev
+            cand["evidence_score"] = ev["evidence_score"]
+            candidates.append(cand)
+    finally:
+        conn.close()
+
+    # remove contradictory candidates (C==1)
+    filtered = [c for c in candidates if c.get("evidence", {}).get("C", 0) == 0]
+
+    # apply minimum evidence threshold if configured (EVIDENCE_MIN)
+    filtered = [c for c in filtered if c.get("evidence_score", -999) >= EVIDENCE_MIN]
+
+    # sort by evidence_score then faiss score
+    filtered.sort(key=lambda x: (x.get("evidence_score", 0.0), x.get("score", 0.0)), reverse=True)
+
+    # pick top_k
+    top_matches = filtered[:top_k]
 
     # Optional: compress top match texts for display (safe, non-destructive)
     compress_context = bool(payload.get("compress_context", False))
@@ -1238,28 +1294,23 @@ def rag_search():
         compress_max_sentences = 1
 
     if compress_context:
-        # Prefer cached compressor helper if available, fall back to simple_compress_text
         compressor = globals().get("get_compressed_chunk")
         for m in top_matches:
             orig_text = m.get("text", "")
             try:
                 if callable(compressor):
-                    # get_compressed_chunk expects (chunk_id, text, max_sentences)
                     summary = compressor(m.get("id"), orig_text, max_sentences=compress_max_sentences)
                 else:
                     summary = simple_compress_text(orig_text, max_sentences=compress_max_sentences)
             except Exception:
-                # Defensive fallback — keep original text when compression fails
                 summary = orig_text
 
-            # Add diagnostic metadata so callers can see compression effect
             m["original_text_length"] = len(orig_text)
             m["compressed_text_length"] = len(summary)
             m["compression_ratio"] = round(len(summary) / (len(orig_text) + 1), 3)
             m["text"] = summary
 
     return jsonify({"query": query, "top_matches": top_matches, "count_scored": count_scored}), 200
-
 
 @app.route('/rag-query', methods=['POST'])
 def rag_query():
@@ -1762,6 +1813,206 @@ def rag_debug():
     finally:
         conn.close()
     return jsonify({"query": query, "candidates": rows}), 200
+
+    # -----------------------------
+    # Minimal RAG evaluation endpoint
+
+    from collections import Counter
+
+    # Example golden set (replace with your own domain-specific Q/A pairs).
+    # Each item should have: query (str), gold_answer (str)
+    GOLD_SET = [
+        {"query": "Where do apples grow?", "gold_answer": "Apples grow on trees."},
+        {"query": "What is an ETF?", "gold_answer": "An ETF is an exchange-traded fund, a basket of securities traded on an exchange."},
+        {"query": "How many calories in a bowl of oatmeal?", "gold_answer": "Approximately 150-200 calories depending on portion and preparation."},
+        {"query": "How to improve squat form?", "gold_answer": "Keep chest up, knees tracking toes, sit back, and keep weight on heels."},
+        {"query": "What is a transformer in AI?", "gold_answer": "A transformer is a neural architecture based on self-attention used for sequence modeling."},
+        {"query": "What is ROE?", "gold_answer": "Return on Equity (ROE) = Net Income / Shareholders' Equity."},
+        {"query": "How often should I do cardio each week?", "gold_answer": "Generally 2-4 sessions per week depending on goals and fitness level."},
+        {"query": "What does 'fine-tuning' mean for models?", "gold_answer": "Fine-tuning adjusts model weights on task-specific data after pretraining."},
+        {"query": "Is diversification important in investing?", "gold_answer": "Yes — it reduces single-asset risk by spreading exposure across assets."},
+        {"query": "How long to rest between heavy sets?", "gold_answer": "Typically 2-5 minutes for maximal strength; 30-90s for hypertrophy."},
+    ]
+
+    # Helper: compute simple token overlap ratio between two strings
+    def token_overlap_ratio(a: str, b: str) -> float:
+        """
+        Return the ratio of overlapping tokens in 'a' compared to the number in 'a'.
+        Used as a simple similarity measure for RAG evaluation.
+        """
+        if not a or not b:
+            return 0.0
+        a_tokens = set(re.findall(r'\w+', a.lower()))
+        b_tokens = set(re.findall(r'\w+', b.lower()))
+        if not a_tokens:
+            return 0.0
+        return float(len(a_tokens & b_tokens)) / float(len(a_tokens))
+
+    # Endpoint: run the evaluation suite
+    @app.route('/rag-eval', methods=['POST'])
+    def rag_eval():
+        """
+        Run a small automatic RAG evaluation against the current FAISS + DB index.
+        POST JSON optional:
+          { "gold": [ { "query": "...", "gold_answer":"..." }, ... ], "top_k": 5 }
+        If 'gold' omitted, uses embedded GOLD_SET above.
+        Returns per-query metrics and aggregated summary.
+        """
+        # Accept both POST with and without JSON payload
+        if not request.is_json:
+            payload = {}
+        else:
+            payload = request.get_json() or {}
+
+        # Use provided gold set, or default GOLD_SET
+        gold = payload.get('gold') or GOLD_SET
+        try:
+            top_k = int(payload.get('top_k', 5))
+        except Exception:
+            top_k = 5
+
+        results = []
+        # Counters for aggregate metrics
+        recall_at_k_counters = {1: 0, 3: 0, 5: 0}
+        support_counts = 0
+        hallucination_counts = 0
+
+        # Prewarm embedding client (optional; best-effort)
+        try:
+            _ = embed_texts(["warmup"])
+        except Exception:
+            pass
+
+        conn = sqlite3.connect(RAG_DB)
+        cur = conn.cursor()
+
+        for item in gold:
+            q = (item.get('query') or '').strip()
+            gold_a = (item.get('gold_answer') or '').strip()
+            if not q:
+                continue
+
+            q_emb = None
+            try:
+                q_emb = embed_texts([q])[0]
+            except Exception as e:
+                app.logger.debug("rag-eval embedding failed for query '%s': %s", q, e)
+                # Embedding failed; skip this query and log error
+                results.append({"query": q, "error": "embedding_failed"})
+                continue
+
+            try:
+                hits = search_faiss_by_vector(q_emb, top_k=max(top_k, 5))
+            except Exception as e:
+                app.logger.debug("rag-eval faiss search failed for query '%s': %s", q, e)
+                results.append({"query": q, "error": "faiss_failed"})
+                continue
+
+            retrieved_texts = []
+            retrieved_ids = []
+            retrieved_scores = []
+            for db_row_id, score in hits:
+                try:
+                    cur.execute("SELECT id, text, metadata FROM docs WHERE id = ?", (db_row_id,))
+                    r = cur.fetchone()
+                    if not r:
+                        continue
+                    _id, text, md_json = r
+                    retrieved_texts.append(text)
+                    retrieved_ids.append(_id)
+                    retrieved_scores.append(float(score))
+                except Exception:
+                    # Skip retrieval issues, keep going
+                    continue
+
+            # Compute Recall@K:
+            for K in (1, 3, 5):
+                top_texts = retrieved_texts[:K]
+                found = False
+                for t in top_texts:
+                    # Conservative threshold, change as needed
+                    if token_overlap_ratio(gold_a, t) >= 0.45:
+                        found = True
+                        break
+                if found:
+                    recall_at_k_counters[K] += 1
+
+            # Compute support rate: fraction of retrieved chunks that support the answer
+            supports = 0
+            for t in retrieved_texts[:top_k]:
+                try:
+                    if chunk_supports_answer(q, t):
+                        supports += 1
+                except Exception:
+                    # Robust to errors inside chunk_supports_answer
+                    pass
+            support_rate = float(supports) / max(1, min(top_k, len(retrieved_texts)))
+            if support_rate > 0:
+                support_counts += 1
+
+            # Hallucination proxy: call rag_query endpoint and check for unsupported answer tokens
+            llm_answer = None
+            hallucinated = False
+            try:
+                # Use lightweight request context to call rag_query internally
+                with app.test_request_context(json={
+                        "query": q,
+                        "top_k": top_k,
+                        "use_llm": True,
+                        "use_reranker": False
+                    }):
+                    resp = rag_query()
+                    # rag_query may return tuple or Response
+                    if isinstance(resp, tuple):
+                        body = resp[0].get_json() if hasattr(resp[0], 'get_json') else resp[0]
+                    elif hasattr(resp, 'get_json'):
+                        body = resp.get_json()
+                    else:
+                        body = resp
+                    llm_answer = (body.get('answer') or "").strip()
+
+                    # Hallucination check: are tokens in the answer present in any retrieved_texts?
+                    ans_tokens = set(re.findall(r'\w+', llm_answer.lower()))
+                    retrieved_tokens = set()
+                    for t in retrieved_texts:
+                        retrieved_tokens.update(re.findall(r'\w+', t.lower()))
+                    # Compute fraction of answer tokens not in retrieved texts
+                    if len(ans_tokens) > 0:
+                        missing = len([tok for tok in ans_tokens if tok not in retrieved_tokens])
+                        missing_ratio = float(missing) / float(len(ans_tokens))
+                        # Flag as hallucination proxy if more than 40% of answer tokens are absent
+                        hallucinated = (missing_ratio > 0.40)
+                        if hallucinated:
+                            hallucination_counts += 1
+            except Exception as e:
+                app.logger.debug("rag-eval rag_query call failed for '%s': %s", q, e)
+
+            # Collect per-query results
+            results.append({
+                "query": q,
+                "gold_answer": gold_a,
+                "retrieved_ids": retrieved_ids[:top_k],
+                "retrieved_scores": retrieved_scores[:top_k],
+                "support_rate": round(support_rate, 3),
+                "llm_answer": llm_answer,
+                "hallucination_proxy": bool(hallucinated)
+            })
+
+        # Close the DB connection
+        conn.close()
+
+        # Compose summary metrics for the response
+        total = float(len(results)) if results else 1.0
+        summary = {
+            "num_queries": int(total),
+            "recall_at_1": round(recall_at_k_counters[1] / total, 3),
+            "recall_at_3": round(recall_at_k_counters[3] / total, 3),
+            "recall_at_5": round(recall_at_k_counters[5] / total, 3),
+            "support_positive_rate": round(support_counts / total, 3),  # Fraction of queries with at least one supporting chunk
+            "hallucination_rate_proxy": round(hallucination_counts / total, 3),
+        }
+
+        return jsonify({"summary": summary, "per_query": results}), 200
 # Run the server
 # -----------------------------
 if __name__ == '__main__':
