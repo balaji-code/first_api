@@ -568,6 +568,17 @@ def expand_entity_hint(entity_hint: str) -> str:
         'dog': 'dog|dogs|puppy|puppies',
         'car': 'car|cars|vehicle|vehicles',
         'computer': 'computer|computers|pc|pcs',
+        # AI / LLM domain additions
+        'transformer': 'transformer|transformers|attention|self-attention|multi-head',
+        'attention': 'attention|self-attention|scaled dot-product|scaled-dot-product',
+        'llm': 'llm|large language model|large language models|language model|language models',
+        'quantization': 'quantization|quantize|int8|8-bit|fp16|4-bit',
+        'fine-tuning': 'fine-tuning|finetuning|fine tune|fine-tunes|fine-tuned',
+        'rlhf': 'rlhf|reinforcement learning from human feedback|human feedback',
+        'tokenization': 'tokenization|tokenizer|bpe|byte-pair encoding|sentencepiece',
+        'inference': 'inference|serving|latency|throughput',
+        'flashattention': 'flashattention|flash attention',
+        'lora': 'lora|low-rank adaptation|low rank adaptation'
     }
     if e in mapping:
         return mapping[e]
@@ -592,27 +603,15 @@ def expand_entity_hint(entity_hint: str) -> str:
 
 # --- Simple inversion penalty heuristic ---
 def simple_inversion_penalty(query: str, passage: str) -> float:
-    """
-    Conservatively detect simple subject-object inversions around the verb 'grow'
-    and apply a heavy penalty (0.05) so inverted passages are downweighted.
-
-    Improvements made in this replacement:
-    - Added detection of explicit contrast words (e.g., "not", "instead") to slightly
-      relax the penalty when the passage explicitly negates or contrasts a claim (returns 0.2)
-      — this helps avoid false positives on sentences like "They grow on plants, not trees." which
-      are contrastive rather than inverted facts.
-    - Keep strong penalty (0.05) when a real inversion is detected.
-    - Be permissive (1.0) when we cannot parse a clear subj/obj or when inputs are empty.
-    """
     try:
         if not query or not passage:
             return 1.0
         q_low = query.lower()
         p_low = passage.lower()
 
-        # look for simple subject / object patterns around 'grow'
-        m_subj = re.search(r"\b([a-z0-9_'-]{1,40})\b\s+grow(?:s|ing)?\b", p_low)
-        m_obj = re.search(r"grow(?:s|ing)?\b\s+on\s+\b([a-z0-9_'-]{1,40})\b", p_low)
+        # detect simple subject / object patterns around common verbs that indicate relation
+        m_subj = re.search(r"\b([a-z0-9_'-]{1,40})\b\s+(?:grow|use|apply|train|fine-?tune|serve|run|make)(?:s|ing)?\b", p_low)
+        m_obj = re.search(r"(?:grow|use|apply|train|fine-?tune|serve|run|make)(?:s|ing)?\b(?:\s+on|\s+with|\s+using|\s+for)?\s*\b([a-z0-9_'-]{1,40})\b", p_low)
 
         if not (m_subj and m_obj):
             return 1.0
@@ -620,32 +619,25 @@ def simple_inversion_penalty(query: str, passage: str) -> float:
         subj = m_subj.group(1)
         obj = m_obj.group(1)
 
-        # Tokenize query safely
         q_tokens = set(re.findall(r"\w+", q_low))
         subj_in_q = subj in q_tokens
         obj_in_q = obj in q_tokens
 
-        # If neither appears in the query, be permissive
         if not subj_in_q and not obj_in_q:
             return 1.0
 
-        # Check for explicit contrast words in the passage which often indicate a correction
-        contrast_words = (" not ", " instead ", " rather ", " but ")
+        contrast_words = (" not ", " instead ", " rather ", " but ", " however ")
         has_contrast = any(w in p_low for w in contrast_words)
 
-        # If only the object appears and it is likely a role-swap (inversion) -> heavy penalty
+                # If only object appears in query and passage contrasts, return stronger penalty
         if obj_in_q and not subj_in_q:
-            # slightly relax penalty if passage explicitly contrasts (e.g. "not trees")
-            return 0.2 if has_contrast else 0.05
+            return 0.20 if has_contrast else 0.08
 
-        # If both appear in the query, this is an ambivalent/leading question.
-        # Apply strong penalty but relax slightly when passage contains explicit contrast words.
+        # If both subject and object appear in the query, it's ambiguous — still apply stricter penalty when contrast exists
         if subj_in_q and obj_in_q:
-            return 0.2 if has_contrast else 0.05
+            return 0.20 if has_contrast else 0.10
 
-        # Other cases (only subj in query) -> no penalty
         return 1.0
-
     except Exception:
         return 1.0
 
@@ -817,10 +809,10 @@ def rerank_and_sort_candidates(
 
 # Get minimum required evidence score from environment variable, default to 0.0 if not set or invalid.
 try:
-    EVIDENCE_MIN = float(os.getenv("RAG_EVIDENCE_MIN", "0.0"))
+    EVIDENCE_MIN = float(os.getenv("RAG_EVIDENCE_MIN", "0.05"))
 except Exception:
     EVIDENCE_MIN = 0.0
-
+    
 def compute_evidence_score(
     query: str,
     candidate: dict,
@@ -847,9 +839,9 @@ def compute_evidence_score(
     Note: Keep this deterministic and conservative during learning.
     """
 
-    # Set default weights if not provided
+        # stronger penalty for contradictions (delta) and slightly higher semantic weight (alpha)
     if weights is None:
-        weights = {"alpha": 0.55, "beta": 0.25, "gamma": 0.10, "delta": 0.80}
+        weights = {"alpha": 0.70, "beta": 0.12, "gamma": 0.10, "delta": 0.85}
 
     text = (candidate.get("text") or "").strip()
     md = candidate.get("metadata") or {}
@@ -1532,12 +1524,12 @@ def rag_query():
             overlap = q_words & c_words
             if len(overlap) == 0:
                 return False
-            # require at least some meaningful overlap (at least 20% of query tokens)
-            if len(overlap) / max(1, len(q_words)) < 0.20:
+            # require at least some meaningful overlap (at least 10% of query tokens)
+            if len(overlap) / max(1, len(q_words)) < 0.10:
                 return False
 
             # Simple inversion detection: if the chunk swaps subject/object roles, consider it unsupported
-            if simple_inversion_penalty(query, chunk_text) < 0.2:
+            if simple_inversion_penalty(query, chunk_text) < 0.15:
                 return False
 
             # Optional embedding similarity check (weak) to guard against coincidental lexical overlap
